@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# uv
+# (uv.lock is committed on purpose)
+
+# Tooling caches
+.ruff_cache/
+.ty_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Vendored AMT repo + its venv, if placed inside the project
+.amt/
+vendor/
+
+# Project outputs
+*.wav
+*.mp3
+*.m4a
+*.mid
+downloads/
+output/

@@ -1,0 +1,51 @@
+[project]
+name = "sound2midi"
+version = "0.1.0"
+description = "Download audio from YouTube and transcribe it to MIDI with instrument-agnostic-amt."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "yt-dlp>=2024.0.0",
+]
+
+[project.optional-dependencies]
+# The MIDI player GUI. Install with: uv sync --extra player
+player = [
+    "PySide6>=6.6",
+    "pyfluidsynth>=1.3.3",
+    "mido>=1.3",
+    "numpy>=1.26",
+    "music21>=9.1",
+]
+
+[project.scripts]
+sound2midi = "sound2midi.cli:main"
+sound2midi-play = "sound2midi.player.app:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "ty>=0.0.1a1",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# `src/sound2midi/_amt` runs inside the AMT venv (imports `infer`, `stem_splitter`).
+# `vendor` holds third-party scripts we must not touch. Neither is our code.
+extend-exclude = ["src/sound2midi/_amt", "vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ty.environment]
+python-version = "3.10"
+root = ["./src"]
+
+[tool.ty.src]
+exclude = ["src/sound2midi/_amt", "vendor"]
