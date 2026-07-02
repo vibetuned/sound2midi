@@ -9,7 +9,11 @@ the vendored ``xml2abc.py`` on the MusicXML.
 
 from __future__ import annotations
 
+import bisect
+import itertools
+import math
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -102,7 +106,217 @@ def find_xml2abc() -> Path | None:
     return None
 
 
-def _build_reduced_midi(src: Path, track_indices: Sequence[int], dest: Path) -> None:
+def _extract_notes(track: Any) -> list[list]:
+    """Note intervals ``[start_tick, end_tick, note, velocity, channel]`` of a track."""
+    notes: list[list] = []
+    active: dict[tuple[int, int], list] = {}
+    tick = 0
+    for msg in track:
+        tick += msg.time
+        if msg.type == "note_on" and msg.velocity > 0:
+            record = [tick, None, msg.note, msg.velocity, msg.channel]
+            active[(msg.channel, msg.note)] = record
+            notes.append(record)
+        elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+            record = active.pop((msg.channel, msg.note), None)
+            if record is not None:
+                record[1] = tick
+    for record in active.values():  # close notes still sounding at track end
+        record[1] = tick
+    return [n for n in notes if n[1] is not None and n[1] > n[0]]
+
+
+def _snap_ragged_onsets(notes: list[list], *, window_ticks: int) -> None:
+    """Align chord attacks: a note starting shortly after a still-sounding note is
+    snapped back to that note's onset (in place). Fixes the A / [A C] half-sliver where
+    a chord-mate's transcribed attack lags the rest of the chord.
+
+    ``window_ticks`` must stay below one quantize-grid slot, otherwise genuinely
+    sequential fast notes (one slot apart) would be merged into fake block chords.
+    """
+    notes.sort(key=lambda n: n[0])
+    anchor: int | None = None
+    cluster_end = 0
+    for record in notes:
+        if anchor is None or record[0] - anchor > window_ticks or record[0] >= cluster_end:
+            anchor, cluster_end = record[0], record[1]
+        else:
+            record[0] = anchor
+            cluster_end = max(cluster_end, record[1])
+
+
+def _snap_ragged_offsets(notes: list[list], *, window_ticks: int) -> None:
+    """Align chord releases: co-sounding notes whose ends fall within the window are
+    trimmed to the cluster's earliest end (in place) — but only if no new note starts
+    inside the ragged span (then the ring is dangling into silence, not harmony).
+    Fixes the [A C] / C half-sliver where one chord-mate rings a little longer."""
+    onsets = sorted(n[0] for n in notes)
+    ordered = sorted(notes, key=lambda n: n[1])
+    cluster: list[list] = []
+
+    def flush() -> None:
+        if len(cluster) < 2:
+            return
+        lo = cluster[0][1]
+        hi = cluster[-1][1]
+        i = bisect.bisect_right(onsets, lo)
+        if i < len(onsets) and onsets[i] < hi:
+            return  # a note attacks inside the span; leave it to the tail-trim pass
+        for n in cluster:
+            n[1] = lo
+
+    for record in ordered:
+        if cluster and record[1] - cluster[0][1] <= window_ticks and record[0] < cluster[0][1]:
+            cluster.append(record)
+        else:
+            flush()
+            cluster = [record]
+    flush()
+
+
+def _trim_legato_tails(notes: list[list], *, sync_ticks: int, max_overlap_ticks: int) -> None:
+    """Cut notes that ring slightly past the next onset, in place.
+
+    Transcribed releases often overlap the next note by a few tens of ms; chordify
+    slices a spurious chord out of every such overlap (A -> C legato becomes
+    A / [A C] / C). A note overlapping the next onset by at most ``max_overlap_ticks``
+    is trimmed to end exactly at that onset. Onsets within ``sync_ticks`` count as the
+    same chord attack (never trim against each other), and overlaps longer than the
+    threshold are kept — those are genuine suspensions/held harmony.
+    """
+    onsets = sorted(n[0] for n in notes)
+    for record in notes:
+        i = bisect.bisect_right(onsets, record[0] + sync_ticks)
+        if i < len(onsets):
+            next_onset = onsets[i]
+            if next_onset < record[1] and (record[1] - next_onset) <= max_overlap_ticks:
+                record[1] = next_onset
+
+
+def _clean_overlaps(notes: list[list], *, sync_ticks: int, max_overlap_ticks: int) -> list[list]:
+    """Full overlap cleanup: align ragged attacks, cut legato tails, align ragged
+    releases. Together these remove all three chordify sliver shapes (A/[AC],
+    A/[AC]/C, [AC]/C) while preserving genuine chords and long suspensions.
+
+    The onset-snap window is half the tail threshold (0.75 of a grid slot) so genuinely
+    sequential fast notes — one slot apart — are never merged into fake chords. The
+    offset snap runs after tail-trimming (which resolves all small sequential overlaps),
+    so remaining co-sounding notes are chord-mates and it can use the full threshold.
+    """
+    _snap_ragged_onsets(notes, window_ticks=max(sync_ticks, max_overlap_ticks // 2))
+    _trim_legato_tails(notes, sync_ticks=sync_ticks, max_overlap_ticks=max_overlap_ticks)
+    _snap_ragged_offsets(notes, window_ticks=max_overlap_ticks)
+    # snapping can create exact duplicates; keep one per (start, end, pitch, channel)
+    unique: dict[tuple[int, int, int, int], list] = {}
+    for record in notes:
+        key = (record[0], record[1], record[2], record[4])
+        kept = unique.get(key)
+        if kept is None or record[3] > kept[3]:
+            unique[key] = record
+    return [n for n in unique.values() if n[1] > n[0]]
+
+
+def _notes_to_track(notes: list[list]) -> Any:
+    """Serialize note intervals back into a delta-time mido track."""
+    events: list[tuple[int, int, Any]] = []
+    for start, end, note_num, velocity, channel in notes:
+        events.append(
+            (start, 1, mido.Message("note_on", note=note_num, velocity=velocity, channel=channel))
+        )
+        events.append(
+            (end, 0, mido.Message("note_off", note=note_num, velocity=0, channel=channel))
+        )
+    events.sort(key=lambda e: (e[0], e[1]))  # note_offs first at equal ticks
+
+    track = mido.MidiTrack()
+    last = 0
+    for tick, _, msg in events:
+        msg.time = tick - last
+        last = tick
+        track.append(msg)
+    track.append(mido.MetaMessage("end_of_track", time=0))
+    return track
+
+
+def _enforce_monophony(notes: list[list], *, min_fragment_ticks: int) -> list[list]:
+    """Rebuild a track as a single voice: at any instant only the most recent attack
+    sounds (ties broken by higher pitch), and a held note *resumes* after an inner note
+    ends. This reconstructs melodies from transcription artifacts like a C4 held right
+    across a Bb3 (chordified as C4 / [Bb3 C4] / C4 -> becomes C4, Bb3, C4). Fragments
+    shorter than ``min_fragment_ticks`` are dropped. Chords are collapsed to their top
+    note, so this is only for tracks the user marks as monophonic."""
+    if not notes:
+        return notes
+    points = sorted({n[0] for n in notes} | {n[1] for n in notes})
+    segments: list[list] = []  # [start, end, source_note_index]
+    for a, b in itertools.pairwise(points):
+        sounding = [i for i, n in enumerate(notes) if n[0] <= a and n[1] >= b]
+        if not sounding:
+            continue
+        winner = max(sounding, key=lambda i: (notes[i][0], notes[i][2]))
+        if segments and segments[-1][2] == winner and segments[-1][1] == a:
+            segments[-1][1] = b  # extend a resumed/continuing fragment
+        else:
+            segments.append([a, b, winner])
+    out: list[list] = []
+    for start, end, i in segments:
+        if end - start < min_fragment_ticks:
+            continue
+        source = notes[i]
+        out.append([start, end, source[2], source[3], source[4]])
+    return out
+
+
+def _snap_to_grid(notes: list[list], *, divisors: Sequence[int], tpb: int) -> list[list]:
+    """Snap note onsets AND offsets to the quantize grid, in tick space.
+
+    music21's quantizer rounds onset and *duration* independently, which can push a
+    note's end past the next note's rounded start — recreating exactly the overlap
+    chords the cleanup passes removed. Rounding both boundaries with the same monotonic
+    function can never create an overlap. Notes shorter than half a grid slot collapse
+    and are dropped (as any quantizer would).
+    """
+
+    def snap(tick: int) -> int:
+        best = tick
+        best_err = None
+        for d in divisors:
+            step = tpb / d
+            candidate = round(round(tick / step) * step)
+            err = abs(candidate - tick)
+            if best_err is None or err < best_err:
+                best, best_err = candidate, err
+        return best
+
+    out: list[list] = []
+    for record in notes:
+        start, end = snap(record[0]), snap(record[1])
+        if end > start:
+            out.append([start, end, record[2], record[3], record[4]])
+    return out
+
+
+def _overlap_threshold_ql(quantize_divisors: Sequence[int] | None) -> float:
+    """Max legato overlap (in quarter lengths) to trim: 1.5x the finest grid unit.
+
+    After quantization, overlaps between ~0.5 and ~1.5 grid units survive as one-slot
+    sliver chords — exactly the artifact we want gone. Longer overlaps span 2+ slots
+    and are treated as genuine harmony.
+    """
+    unit = 1.0 / max(quantize_divisors) if quantize_divisors else 0.25
+    return 1.5 * unit
+
+
+def _build_reduced_midi(
+    src: Path,
+    track_indices: Sequence[int],
+    dest: Path,
+    *,
+    trim_overlap_ql: float | None = None,
+    mono_tracks: frozenset[int] = frozenset(),
+    mono_min_fragment_ql: float = 0.125,
+    quantize_divisors: Sequence[int] | None = None,
+) -> None:
     """Write a MIDI containing only the given tracks plus a tempo/meta conductor."""
     orig = mido.MidiFile(str(src))
     reduced = mido.MidiFile(type=1, ticks_per_beat=orig.ticks_per_beat)
@@ -125,11 +339,179 @@ def _build_reduced_midi(src: Path, track_indices: Sequence[int], dest: Path) -> 
     conductor.append(mido.MetaMessage("end_of_track", time=0))
     reduced.tracks.append(conductor)
 
+    tpb = orig.ticks_per_beat
     for index in track_indices:
-        if 0 <= index < len(orig.tracks):
-            reduced.tracks.append(orig.tracks[index])
+        if not (0 <= index < len(orig.tracks)):
+            continue
+        notes = _extract_notes(orig.tracks[index])
+        if trim_overlap_ql:
+            notes = _clean_overlaps(
+                notes,
+                sync_ticks=max(1, tpb // 16),
+                max_overlap_ticks=round(trim_overlap_ql * tpb),
+            )
+        if index in mono_tracks:
+            notes = _enforce_monophony(
+                notes, min_fragment_ticks=max(1, round(mono_min_fragment_ql * tpb))
+            )
+        if quantize_divisors:
+            notes = _snap_to_grid(notes, divisors=quantize_divisors, tpb=tpb)
+        reduced.tracks.append(_notes_to_track(notes))
 
     reduced.save(str(dest))
+
+
+def _tick_to_sec_fn(mid: Any) -> Any:
+    """A tick -> absolute-seconds function honoring the file's tempo map."""
+    changes: list[tuple[int, int]] = []
+    for track in mid.tracks:
+        tick = 0
+        for msg in track:
+            tick += msg.time
+            if msg.is_meta and msg.type == "set_tempo":
+                changes.append((tick, msg.tempo))
+    changes.sort(key=lambda c: c[0])
+    if not changes or changes[0][0] != 0:
+        changes.insert(0, (0, 500000))  # default 120 BPM
+
+    segments: list[tuple[int, float, int]] = []  # (start_tick, start_sec, tempo)
+    for i, (tick, tempo) in enumerate(changes):
+        if i == 0:
+            segments.append((tick, 0.0, tempo))
+        else:
+            ptick, psec, ptempo = segments[-1]
+            sec = psec + mido.tick2second(tick - ptick, mid.ticks_per_beat, ptempo)
+            segments.append((tick, sec, tempo))
+
+    starts = [s[0] for s in segments]
+
+    def tick_to_sec(tick: int) -> float:
+        i = max(0, bisect.bisect_right(starts, tick) - 1)
+        stick, ssec, tempo = segments[i]
+        return ssec + mido.tick2second(tick - stick, mid.ticks_per_beat, tempo)
+
+    return tick_to_sec
+
+
+class _BeatGrid:
+    """Maps absolute seconds to felt-beat positions, anchored at the first downbeat."""
+
+    def __init__(self, meter: dict) -> None:
+        self.beats: list[float] = [float(b) for b in meter["beats"]]
+        if len(self.beats) < 2:
+            raise ValueError("Beat grid needs at least 2 beats.")
+        self.period = statistics.median(
+            b - a for a, b in zip(self.beats[:-1], self.beats[1:], strict=False)
+        )
+        self.compound = bool(meter.get("compound", False))
+        self.beat_ql = 1.5 if self.compound else 1.0
+        self.felt_per_bar = int(meter.get("felt_beats_per_bar") or meter.get("numerator", 4))
+        self.bpm = float(meter.get("bpm") or 60.0 / self.period)
+
+        first_downbeat = meter.get("first_downbeat")
+        if first_downbeat is None:
+            self.anchor = 0
+        else:  # index of the beat closest to the first downbeat
+            self.anchor = min(
+                range(len(self.beats)), key=lambda i: abs(self.beats[i] - float(first_downbeat))
+            )
+
+    def pos(self, t: float) -> float:
+        """Felt-beat position of time ``t`` relative to the first downbeat."""
+        beats = self.beats
+        i = bisect.bisect_right(beats, t) - 1
+        if i < 0:
+            raw = (t - beats[0]) / self.period
+        elif i >= len(beats) - 1:
+            raw = (len(beats) - 1) + (t - beats[-1]) / self.period
+        else:
+            raw = i + (t - beats[i]) / (beats[i + 1] - beats[i])
+        return raw - self.anchor
+
+
+def _min_beat_position(src: Any, track_indices: Sequence[int], grid: _BeatGrid) -> float:
+    """Earliest felt-beat position of any selected note (for a shared pickup shift)."""
+    tick_to_sec = _tick_to_sec_fn(src)
+    minimum = math.inf
+    for index in track_indices:
+        if not (0 <= index < len(src.tracks)):
+            continue
+        tick = 0
+        for msg in src.tracks[index]:
+            tick += msg.time
+            if msg.type == "note_on" and msg.velocity > 0:
+                minimum = min(minimum, grid.pos(tick_to_sec(tick)))
+                break  # tracks are time-ordered; first note is the earliest
+    return 0.0 if minimum is math.inf else minimum
+
+
+_EXPORT_TPB = 480
+
+
+def _build_beat_aligned_midi(
+    src: Any,
+    track_indices: Sequence[int],
+    dest: Path,
+    *,
+    meter: dict,
+    grid: _BeatGrid,
+    beat_shift: float,
+    trim_overlap_ql: float | None = None,
+    mono_tracks: frozenset[int] = frozenset(),
+    mono_min_fragment_ql: float = 0.125,
+    quantize_divisors: Sequence[int] | None = None,
+) -> None:
+    """Write a reduced MIDI retimed to the beat grid, with real tempo + time signature.
+
+    Note times are mapped from seconds to felt-beat positions (piecewise-linear between
+    tracked beats), so a quarter note in the output is an actual beat of the music and
+    bar 1 starts on the first downbeat. ``beat_shift`` (whole bars, in felt beats) makes
+    room for pickup notes and must be identical across staves to keep them aligned.
+    """
+    tick_to_sec = _tick_to_sec_fn(src)
+    out = mido.MidiFile(type=1, ticks_per_beat=_EXPORT_TPB)
+
+    conductor = mido.MidiTrack()
+    conductor.append(
+        mido.MetaMessage(
+            "time_signature",
+            numerator=int(meter.get("numerator", 4)),
+            denominator=int(meter.get("denominator", 4)),
+            time=0,
+        )
+    )
+    conductor.append(
+        mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(grid.bpm * grid.beat_ql), time=0)
+    )
+    conductor.append(mido.MetaMessage("end_of_track", time=0))
+    out.tracks.append(conductor)
+
+    def new_tick(abs_tick: int) -> int:
+        beat_pos = grid.pos(tick_to_sec(abs_tick)) + beat_shift
+        return max(0, round(beat_pos * grid.beat_ql * _EXPORT_TPB))
+
+    for index in track_indices:
+        if not (0 <= index < len(src.tracks)):
+            continue
+        notes = _extract_notes(src.tracks[index])
+        for record in notes:
+            record[0] = new_tick(record[0])
+            record[1] = max(record[0] + 1, new_tick(record[1]))
+        if trim_overlap_ql:
+            notes = _clean_overlaps(
+                notes,
+                sync_ticks=max(1, _EXPORT_TPB // 16),
+                max_overlap_ticks=round(trim_overlap_ql * _EXPORT_TPB),
+            )
+        if index in mono_tracks:
+            notes = _enforce_monophony(
+                notes, min_fragment_ticks=max(1, round(mono_min_fragment_ql * _EXPORT_TPB))
+            )
+        if quantize_divisors:
+            notes = _snap_to_grid(notes, divisors=quantize_divisors, tpb=_EXPORT_TPB)
+        out.tracks.append(_notes_to_track(notes))
+
+    out.save(str(dest))
 
 
 def _staff_part(
@@ -139,21 +521,49 @@ def _staff_part(
     quantize_divisors: Sequence[int] | None,
     treble: bool,
     key_label: str | None = None,
+    meter: dict | None = None,
+    grid: _BeatGrid | None = None,
+    beat_shift: float = 0.0,
+    trim_overlap_ql: float | None = None,
+    mono_tracks: frozenset[int] = frozenset(),
+    mono_min_fragment_ql: float = 0.125,
 ) -> Any:
     """Build one chordified staff (a music21 Part) from the given tracks."""
     # music21's MIDI parser quantizes on import, so the grid must be set at parse time
     # (a post-parse quantize() is a no-op against the parser's own snapping).
     with tempfile.TemporaryDirectory() as tmp:
         reduced_midi = Path(tmp) / "reduced.mid"
-        _build_reduced_midi(midi_path, track_indices, reduced_midi)
-        if quantize_divisors:
-            score = converter.parse(
-                str(reduced_midi),
-                quantizePost=True,
-                quarterLengthDivisors=tuple(quantize_divisors),
+        if meter is not None and grid is not None:
+            src = mido.MidiFile(str(midi_path))
+            _build_beat_aligned_midi(
+                src,
+                track_indices,
+                reduced_midi,
+                meter=meter,
+                grid=grid,
+                beat_shift=beat_shift,
+                trim_overlap_ql=trim_overlap_ql,
+                mono_tracks=mono_tracks,
+                mono_min_fragment_ql=mono_min_fragment_ql,
+                quantize_divisors=quantize_divisors,
             )
         else:
+            _build_reduced_midi(
+                midi_path,
+                track_indices,
+                reduced_midi,
+                trim_overlap_ql=trim_overlap_ql,
+                mono_tracks=mono_tracks,
+                mono_min_fragment_ql=mono_min_fragment_ql,
+                quantize_divisors=quantize_divisors,
+            )
+        if quantize_divisors:
+            # already snapped to the grid in tick space (see _snap_to_grid); music21's
+            # own quantizer would round onsets/durations independently and could
+            # recreate the overlap chords the cleanup passes removed.
             score = converter.parse(str(reduced_midi), quantizePost=False)
+        else:
+            score = converter.parse(str(reduced_midi))
     part = score.chordify()
 
     # Drop MIDI/instrument metadata (programs, channels) that music21 carries over from the
@@ -211,6 +621,9 @@ def export_to_staff(
     formats: Sequence[str] = ("musicxml", "abc"),
     quantize_divisors: Sequence[int] | None = (4,),
     key: str | None = None,
+    meter: dict | None = None,
+    trim_overlaps: bool = True,
+    mono_tracks: frozenset[int] | set[int] = frozenset(),
     title: str | None = None,
 ) -> dict[str, Path]:
     """Export the chosen tracks of ``midi_path`` to notation files in ``out_dir``.
@@ -220,8 +633,12 @@ def export_to_staff(
 
     ``quantize_divisors`` sets the notation grid as music21 quarter-length divisors,
     e.g. ``(4,)`` = 16th-note grid (clean, no tuplets), ``(4, 3)`` = 16ths + triplets,
-    ``None`` = keep raw timing. Returns a mapping of produced format -> path (and
-    "abc_error" if ABC could not be produced).
+    ``None`` = keep raw timing.
+
+    ``meter`` is a detected-meter artifact (from ``<song>.meter.json``). When it carries
+    a beat grid, notes are retimed to it: the output gets the real tempo and time
+    signature, and bar 1 is anchored on the first downbeat. Returns a mapping of
+    produced format -> path (and "abc_error" if ABC could not be produced).
     """
     midi_path = Path(midi_path)
     out_dir = Path(out_dir)
@@ -234,6 +651,23 @@ def export_to_staff(
     mode = "grand" if len(staves) >= 2 else "single"
     basename = basename or f"{midi_path.stem}.{mode}"
 
+    grid: _BeatGrid | None = None
+    beat_shift = 0.0
+    if meter is not None and len(meter.get("beats") or []) >= 8:
+        grid = _BeatGrid(meter)
+        # one shift for ALL staves so they stay bar-aligned; whole bars only
+        src = mido.MidiFile(str(midi_path))
+        all_tracks = [t for staff in staves for t in staff]
+        min_pos = _min_beat_position(src, all_tracks, grid)
+        if min_pos < 0:
+            bars = math.ceil(-min_pos / grid.felt_per_bar)
+            beat_shift = bars * grid.felt_per_bar
+    else:
+        meter = None  # no usable beat grid -> plain export
+
+    trim_overlap_ql = _overlap_threshold_ql(quantize_divisors) if trim_overlaps else None
+    grid_unit = 1.0 / max(quantize_divisors) if quantize_divisors else 0.25
+
     parts = [
         _staff_part(
             midi_path,
@@ -241,6 +675,12 @@ def export_to_staff(
             quantize_divisors=quantize_divisors,
             treble=(i == 0),
             key_label=key,
+            meter=meter,
+            grid=grid,
+            beat_shift=beat_shift,
+            trim_overlap_ql=trim_overlap_ql,
+            mono_tracks=frozenset(mono_tracks),
+            mono_min_fragment_ql=grid_unit / 2,
         )
         for i, tracks in enumerate(staves)
     ]

@@ -203,6 +203,25 @@ class LoadedSong:
     path: Path | None = field(default=None)
 
 
+def polyphony_ratio(notes: list[tuple[float, float, int]]) -> float:
+    """Fraction of sounding time where 2+ notes overlap. ~0 for a melodic line."""
+    if not notes:
+        return 0.0
+    events = sorted([(start, 1) for start, _, _ in notes] + [(end, -1) for _, end, _ in notes])
+    sounding = poly = 0.0
+    depth = 0
+    prev = events[0][0]
+    for t, delta in events:
+        span = t - prev
+        if depth >= 1:
+            sounding += span
+        if depth >= 2:
+            poly += span
+        depth += delta
+        prev = t
+    return poly / sounding if sounding > 0 else 0.0
+
+
 def _message_order(msg: Any) -> int:
     return {
         "program_change": 0,

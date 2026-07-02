@@ -10,13 +10,29 @@ Built on the Astral stack: [`uv`](https://docs.astral.sh/uv/) for packaging,
 
 ## How it works
 
-```
-                                         ┌─(default)──────────────▶ <song>.mid
-YouTube URL ─(yt-dlp+ffmpeg)▶ audio.wav ─┤
-                                         └─(--stems)─ separate ─▶ transcribe each ─▶ merge ─▶ <song>.stems.mid
-                                                     (BS-RoFormer)   (per-stem model)
+```mermaid
+flowchart LR
+    URL["YouTube URL"] -->|"yt-dlp + ffmpeg"| WAV["song.wav"]
 
-<song>.mid ──(sound2midi-play: FluidSynth + soundfont)──▶ 🔊 + piano roll, solo / mute / together
+    WAV -->|"AMT (default)"| MID["song.mid"]
+    WAV -->|"--stems: BS-RoFormer"| STEMS["6 stem WAVs"]
+    STEMS -->|"AMT, matching model per stem"| SMID["per-stem MIDIs"]
+    SMID -->|"merge"| MERGED["song.stems.mid"]
+
+    WAV -->|"S-KEY"| KEY["key.json"]
+    WAV -->|"Beat This!"| METER["meter.json<br/>tempo + time signature + beat grid"]
+
+    MID --> PLAYER
+    MERGED --> PLAYER
+    KEY --> PLAYER
+    METER --> PLAYER
+
+    subgraph PLAYER["sound2midi-play — FluidSynth 🔊, piano roll, solo/mute"]
+        SEL["staff assignment (1/2) · 1v single-voice ·<br/>legato trim · quantize grid · key/meter toggles"]
+    end
+
+    SEL -->|"music21: beat-aligned bars,<br/>respelled to key"| XML["MusicXML"]
+    XML -->|"vendor/xml2abc.py"| ABC["ABC"]
 ```
 
 `sound2midi` itself is a lightweight orchestrator. Because the AMT project is a
@@ -54,6 +70,7 @@ output/<song>/
   <song>.mid         # single-model transcription
   <song>.stems.mid   # merged stem transcription (with --stems)
   <song>.key.json    # detected musical key (skey)
+  <song>.meter.json  # detected tempo + time signature + beat grid (beat-this)
   stems/             # stem intermediates (separated WAVs + per-stem MIDIs)
 ```
 
@@ -112,6 +129,17 @@ to `<song>.key.json` (e.g. `{"key": "Bb minor", ...}`). The MIDI files are left
 unchanged. Pass `--no-key` to skip it. skey is installed into the AMT venv on first use
 (it reuses that environment's torch), so no extra heavy download.
 
+### Tempo + time-signature detection
+
+By default the song's beats and downbeats are tracked with
+[Beat This!](https://github.com/CPJKU/beat_this) (CPJKU, ISMIR 2024) and distilled into
+`<song>.meter.json`: time signature (mode of beats-per-bar between downbeats), tempo
+(median inter-beat interval), and a compound-meter test that snaps the transcribed
+MIDI's between-beat onsets to duple vs triple grids (a triple majority turns 2/4 into
+6/8, etc.). The artifact stores the full beat/downbeat grid, which the exporter uses for
+beat alignment. Pass `--no-meter` to skip. Like skey, it installs into the AMT venv on
+first use (plain PyTorch, no madmom).
+
 ## Play (`sound2midi-play`)
 
 A small PySide6 app that synthesizes a MIDI with FluidSynth and shows a **per-instrument
@@ -147,12 +175,33 @@ notes/rests with no tuplets; coarser = simpler, and `… + triplets` options are
 you need them). Transcribed audio has micro-timing, so a sensible grid is what keeps the
 score readable.
 
+**Legato trim** (on by default) removes chordify's three sliver-chord artifacts, which
+come from transcription timing noise: legato tails (A ringing into C → A/[A C]/C),
+ragged chord attacks (a chord-mate arriving late → A/[A C]), and ragged releases (one
+chord-mate ringing longer → [A C]/C). Tails up to 1.5 grid units are cut at the next
+onset; attack/release raggedness under a grid slot is snapped together. Genuine chords,
+long suspensions, and fast legato runs (notes a full slot apart) are preserved.
+
+Each lane also has a **1v** (single voice) checkbox for melodic instruments: the track is
+rebuilt so only the most recent attack sounds, and a held note *resumes* after an inner
+note ends — which repairs pedal-tone artifacts like C / [B♭ C] / C into the actual melody
+C, B♭, C (chords collapse to their top note). It is auto-checked for tracks that play
+mostly one note at a time (polyphony ratio < 0.3) and can be toggled per lane.
+
 If a `<song>.key.json` is present in the folder, its key is loaded and shown as a **Key:**
 toggle (on by default). When applied, it is written as the score's key signature (skey's
 theoretical spellings like "G# Major" are normalized to their common enharmonic, e.g. Ab
 major) **and the notes are respelled to the key** — diatonic tones stay accidental-free and
 chromatic tones use the key's flats/sharps (so an A# in a flat key becomes Bb), preserving
 the sounding pitch. This is what makes the transcribed notation actually readable.
+
+If a `<song>.meter.json` is present, a **Meter:** toggle appears (e.g. "4/4 ♩≈176", on by
+default). When applied, the export is **retimed to the detected beat grid**: notes are
+mapped from seconds to beat positions (piecewise-linear between tracked beats), the real
+tempo and time signature are written into the score, and **bar 1 is anchored on the first
+downbeat** (pickup notes get whole leading bars, identical across both staves). Without
+this, the MIDI's flat default tempo (120) makes barlines and rhythm values arbitrary;
+with it, a "1/16" on the grid selector is an actual sixteenth of the music.
 
 The score is reduced to just **pitch + rhythm on a single Piano instrument** — the source
 tracks' MIDI programs/channels are stripped, so there are no stray "instrument change"
@@ -176,6 +225,7 @@ set `$SOUND2MIDI_XML2ABC` to point elsewhere). Conversion uses [music21](https:/
 | `--device` | `cuda` (default if available) or `cpu` |
 | `--no-amp` / `--amp-dtype` | Control mixed precision (default: on, `bf16`) |
 | `--no-key` | Skip key detection (on by default; saved to `<song>.key.json`) |
+| `--no-meter` | Skip tempo/time-signature detection (on by default; saved to `<song>.meter.json`) |
 | `--amt-home` | Where to keep the AMT checkout + venv |
 | `--reinstall` | Rebuild the AMT venv from scratch |
 | `--infer-arg` | Forward a raw flag to `infer.py` (repeatable) |
@@ -198,5 +248,37 @@ Layout:
 - `src/sound2midi/_amt/stem_pipeline.py` — runs **inside the AMT venv**; faithful port of
   the Colab stem workflow (excluded from this package's lint/type-check surface).
 - `src/sound2midi/_amt/key_detect.py` — runs **inside the AMT venv**; skey key detection.
+- `src/sound2midi/_amt/meter_detect.py` — runs **inside the AMT venv**; Beat This! beat
+  tracking + meter/tempo inference.
 - `src/sound2midi/player/` — FluidSynth playback `engine`, `pianoroll` lanes, `export`
-  (music21 → MusicXML/ABC), PySide6 window.
+  (beat-aligned music21 → MusicXML/ABC), PySide6 window.
+
+## Roadmap
+
+Planned artifacts, mainly to feed [midi-stroke](https://github.com/vibetuned/midi-stroke)
+(a MIDI-hardware training app that renders notation with Verovio):
+
+- **MEI export** via [Verovio](https://www.verovio.org/) — native format for
+  midi-stroke's renderer (MusicXML → MEI, or direct).
+- **Transposition** — export parts for transposing instruments (Bb/Eb saxophone modes).
+- **Background-music export** — render "everything except the practiced instrument" to
+  audio as a backing track (the player engine's offline renderer already honors
+  solo/mute, so this is a thin feature on top of the stems).
+- More per-song artifacts (chords, sections, …) as midi-stroke needs them.
+
+## References
+
+Models and papers this pipeline builds on:
+
+| Component | Repo | Paper |
+|---|---|---|
+| Transcription (AMT) | [anime-song/instrument-agnostic-amt](https://github.com/anime-song/instrument-agnostic-amt) | — |
+| Stem separation | [stem-splitter](https://pypi.org/project/stem-splitter/) (BS-RoFormer) | Lu et al., *Music Source Separation with Band-Split RoPE Transformer*, ICASSP 2024 |
+| Key detection | [deezer/skey](https://github.com/deezer/skey) | Kong et al., *S-KEY: Self-Supervised Learning of Major and Minor Keys from Audio*, ICASSP 2025; predecessor [deezer/stone](https://github.com/deezer/stone), *STONE: Self-Supervised Tonality Estimator*, ISMIR 2024 |
+| Beat/downbeat tracking | [CPJKU/beat_this](https://github.com/CPJKU/beat_this) | Foscarin, Schlüter, Widmer, *Beat This! Accurate Beat Tracking Without DBN Postprocessing*, ISMIR 2024 |
+
+Tooling: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [music21](https://github.com/cuthbertLab/music21)
+(MIT, Cuthbert et al.), [mido](https://github.com/mido/mido),
+[FluidSynth](https://www.fluidsynth.org/) / [pyfluidsynth](https://github.com/nwhitehead/pyfluidsynth),
+[PySide6](https://doc.qt.io/qtforpython-6/), and Willem G. Vree's
+[xml2abc / abc2xml](https://wim.vree.org/svgParse/) (vendored in `vendor/`).

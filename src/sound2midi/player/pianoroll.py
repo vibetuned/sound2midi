@@ -133,6 +133,7 @@ class InstrumentLane(QFrame):
         *,
         on_seek: Callable[[], None] | None = None,
         on_toggle: Callable[[], None] | None = None,
+        mono_default: bool = False,
     ) -> None:
         super().__init__()
         self.track = track
@@ -145,7 +146,7 @@ class InstrumentLane(QFrame):
         layout.setSpacing(4)
 
         control = QWidget()
-        control.setFixedWidth(180)
+        control.setFixedWidth(210)
         crow = QHBoxLayout(control)
         crow.setContentsMargins(0, 0, 0, 0)
         crow.setSpacing(3)
@@ -155,6 +156,13 @@ class InstrumentLane(QFrame):
         self.staff2_box = QCheckBox("2")
         self.staff2_box.setToolTip("Add to staff 2 (bottom / bass) for export")
         self.staff2_box.setVisible(False)  # shown only in grand-staff mode
+        self.mono_box = QCheckBox("1v")
+        self.mono_box.setChecked(mono_default)
+        self.mono_box.setToolTip(
+            "Export as a single voice (melody): the most recent attack wins and held "
+            "notes resume afterwards — removes pedal-tone artifacts like C / [Bb C] / C. "
+            "Auto-checked for tracks that play mostly one note at a time."
+        )
 
         swatch = QLabel()
         swatch.setFixedWidth(8)
@@ -179,6 +187,7 @@ class InstrumentLane(QFrame):
 
         crow.addWidget(self.staff1_box)
         crow.addWidget(self.staff2_box)
+        crow.addWidget(self.mono_box)
         crow.addWidget(swatch)
         crow.addWidget(name, 1)
         crow.addWidget(self.solo_btn)
@@ -224,3 +233,6 @@ class InstrumentLane(QFrame):
 
     def on_staff2(self) -> bool:
         return self.staff2_box.isChecked()
+
+    def is_mono(self) -> bool:
+        return self.mono_box.isChecked()

@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from sound2midi.player.engine import PlayerEngine
+from sound2midi.player.engine import PlayerEngine, polyphony_ratio
 from sound2midi.player.export import export_to_staff
 from sound2midi.player.pianoroll import InstrumentLane
 
@@ -48,6 +48,7 @@ class PlayerWindow(QMainWindow):
         self._dragging = False
         self._lanes: list[InstrumentLane] = []
         self._detected_key: str | None = None
+        self._detected_meter: dict | None = None
         self._build_ui()
 
         self._timer = QTimer(self)
@@ -133,6 +134,21 @@ class PlayerWindow(QMainWindow):
             "Apply the detected key signature (from <song>.key.json) to the exported score"
         )
         export.addWidget(self.apply_key_box)
+        self.apply_meter_box = QCheckBox("Meter: —")
+        self.apply_meter_box.setEnabled(False)
+        self.apply_meter_box.setToolTip(
+            "Retime the export to the detected beat grid (from <song>.meter.json): real "
+            "tempo + time signature, bars anchored on downbeats"
+        )
+        export.addWidget(self.apply_meter_box)
+        self.trim_box = QCheckBox("Legato trim")
+        self.trim_box.setChecked(True)
+        self.trim_box.setToolTip(
+            "Cut notes that ring slightly past the next onset, so legato lines don't "
+            "turn into sliver chords (A → C becoming A/[A C]/C). Real chords and long "
+            "suspensions are kept."
+        )
+        export.addWidget(self.trim_box)
         self.fmt_musicxml = QCheckBox("MusicXML")
         self.fmt_musicxml.setChecked(True)
         self.fmt_abc = QCheckBox("ABC")
@@ -179,12 +195,18 @@ class PlayerWindow(QMainWindow):
         self._lanes.clear()
         n = len(song.tracks)
         for track in song.tracks:
+            # Melodic tracks sit well below ~0.3 polyphony (their overlap is mostly
+            # transcription ring); real polyphony (piano, guitars, pads) sits above.
+            mono_default = (
+                not track.is_drum and track.note_count >= 10 and polyphony_ratio(track.notes) < 0.30
+            )
             lane = InstrumentLane(
                 track,
                 self.engine,
                 n,
                 on_seek=self._after_seek,
                 on_toggle=self._refresh_lanes,
+                mono_default=mono_default,
             )
             self._lanes.append(lane)
             self.lane_layout.insertWidget(self.lane_layout.count() - 1, lane)
@@ -199,6 +221,19 @@ class PlayerWindow(QMainWindow):
             self.apply_key_box.setChecked(False)
             self.apply_key_box.setEnabled(False)
 
+        self._detected_meter = self._load_meter(path)
+        if self._detected_meter:
+            ts = self._detected_meter.get("time_signature", "?")
+            bpm = self._detected_meter.get("bpm")
+            label = f"Meter: {ts}" + (f" ♩≈{round(bpm)}" if bpm else "")
+            self.apply_meter_box.setText(label)
+            self.apply_meter_box.setEnabled(True)
+            self.apply_meter_box.setChecked(True)
+        else:
+            self.apply_meter_box.setText("Meter: —")
+            self.apply_meter_box.setChecked(False)
+            self.apply_meter_box.setEnabled(False)
+
         self.play_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
         self.position.setEnabled(True)
@@ -208,23 +243,33 @@ class PlayerWindow(QMainWindow):
         self._update_time()
 
     @staticmethod
-    def _load_key(midi_path: Path) -> str | None:
-        """Find and read a sibling <song>.key.json artifact, if any."""
+    def _load_artifact(midi_path: Path, suffix: str) -> dict | None:
+        """Find and read a sibling <song>.<suffix>.json artifact, if any."""
         parent = midi_path.parent
         stem = midi_path.stem
         candidates = [
-            parent / f"{parent.name}.key.json",
-            parent / f"{stem}.key.json",
-            parent / f"{stem.replace('.stems', '')}.key.json",
-            *sorted(parent.glob("*.key.json")),
+            parent / f"{parent.name}.{suffix}.json",
+            parent / f"{stem}.{suffix}.json",
+            parent / f"{stem.replace('.stems', '')}.{suffix}.json",
+            *sorted(parent.glob(f"*.{suffix}.json")),
         ]
         for path in candidates:
             if path.is_file():
                 try:
-                    return json.loads(path.read_text()).get("key")
+                    data = json.loads(path.read_text())
                 except (json.JSONDecodeError, OSError):
                     continue
+                if isinstance(data, dict):
+                    return data
         return None
+
+    def _load_key(self, midi_path: Path) -> str | None:
+        data = self._load_artifact(midi_path, "key")
+        return data.get("key") if data else None
+
+    def _load_meter(self, midi_path: Path) -> dict | None:
+        data = self._load_artifact(midi_path, "meter")
+        return data if data and data.get("time_signature") else None
 
     def _open_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -328,6 +373,10 @@ class PlayerWindow(QMainWindow):
         formats_tuple = tuple(formats)
         apply_key = self.apply_key_box.isChecked() and self._detected_key
         key = self._detected_key if apply_key else None
+        apply_meter = self.apply_meter_box.isChecked() and self._detected_meter
+        meter = self._detected_meter if apply_meter else None
+        trim_overlaps = self.trim_box.isChecked()
+        mono_tracks = frozenset(lane.track.index for lane in self._lanes if lane.is_mono())
 
         self.export_btn.setEnabled(False)
         self.export_btn.setText("Exporting…")
@@ -342,6 +391,9 @@ class PlayerWindow(QMainWindow):
                     formats=formats_tuple,
                     quantize_divisors=quantize_divisors,
                     key=key,
+                    meter=meter,
+                    trim_overlaps=trim_overlaps,
+                    mono_tracks=mono_tracks,
                     title=midi_path.stem,
                 )
                 self.export_done.emit(result)

@@ -270,6 +270,70 @@ def ensure_key_deps(home: Path, *, reinstall: bool = False) -> Path:
     return python
 
 
+# Beat/meter detection deps (Beat This!, CPJKU) — plain PyTorch, rides the AMT venv.
+METER_DEPS = ("beat-this",)
+
+
+def _meter_detect_script() -> Path:
+    return Path(__file__).resolve().parent / "_amt" / "meter_detect.py"
+
+
+def ensure_meter_deps(home: Path, *, reinstall: bool = False) -> Path:
+    """Ensure the AMT env plus beat-this (meter detection) are installed."""
+    python = ensure_env(home, reinstall=reinstall)
+    marker = home / ".venv" / ".sound2midi-meter-deps-installed"
+    if marker.exists() and not reinstall:
+        return python
+    _run([_uv(), "pip", "install", "--python", str(python), *METER_DEPS])
+    marker.write_text("ok\n")
+    return python
+
+
+def detect_meter(
+    audio_path: Path,
+    *,
+    home: Path,
+    midi_path: Path | None = None,
+    device: str | None = None,
+    output_json: Path | None = None,
+) -> dict:
+    """Detect tempo + time signature of ``audio_path``; optionally save the artifact.
+
+    Returns the summary dict, e.g. ``{"time_signature": "4/4", "bpm": 176.5, ...}``.
+    The JSON artifact additionally contains the full beat/downbeat grid.
+    """
+    python = ensure_meter_deps(home)
+    cmd: list[str] = [
+        str(python),
+        str(_meter_detect_script()),
+        "--audio",
+        str(audio_path.resolve()),
+        "--device",
+        device or "cuda",
+    ]
+    if midi_path is not None and midi_path.exists():
+        cmd += ["--midi", str(midi_path.resolve())]
+    if output_json is not None:
+        cmd += ["--output-json", str(output_json.resolve())]
+
+    print(f"$ {' '.join(cmd)}", file=sys.stderr, flush=True)
+    result = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, check=True)
+
+    for line in reversed(result.stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                summary = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "time_signature" in summary:
+                return summary
+    raise RuntimeError(
+        f"meter detection produced no result.\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr[-800:]}"
+    )
+
+
 def detect_key(
     audio_path: Path,
     *,

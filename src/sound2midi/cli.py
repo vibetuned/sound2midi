@@ -12,6 +12,7 @@ from sound2midi.amt import (
     MODEL_TYPES,
     default_amt_home,
     detect_key,
+    detect_meter,
     setup,
     transcribe,
     transcribe_stems,
@@ -129,6 +130,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip key detection (it runs by default via skey, saved as <song>.key.json).",
     )
     parser.add_argument(
+        "--no-meter",
+        dest="detect_meter",
+        action="store_false",
+        help="Skip tempo/time-signature detection (runs by default via beat-this, "
+        "saved as <song>.meter.json).",
+    )
+    parser.add_argument(
         "-f",
         "--force",
         action="store_true",
@@ -238,5 +246,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Key detection failed: {exc}", file=sys.stderr)
         elif not args.quiet:
             print(f"Key already detected: {key_json}")
+
+    if args.detect_meter:
+        meter_json = song_dir / f"{song_name}.meter.json"
+        if args.force or not meter_json.exists():
+            if not args.quiet:
+                print("Detecting tempo + time signature (beat-this) ...")
+            try:
+                meter = detect_meter(
+                    audio_path,
+                    home=amt_home,
+                    midi_path=output_midi,
+                    device=args.device,
+                    output_json=meter_json,
+                )
+                print(
+                    f"Detected meter: {meter['time_signature']} at {meter['bpm']} bpm  "
+                    f"(saved to {meter_json})"
+                )
+            except Exception as exc:  # non-fatal: don't lose the transcription
+                print(f"Meter detection failed: {exc}", file=sys.stderr)
+        elif not args.quiet:
+            print(f"Meter already detected: {meter_json}")
 
     return 0
