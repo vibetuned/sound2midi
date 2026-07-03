@@ -216,6 +216,43 @@ def _clean_overlaps(notes: list[list], *, sync_ticks: int, max_overlap_ticks: in
     return [n for n in unique.values() if n[1] > n[0]]
 
 
+# A section window in some tick space: (in_start, in_end, out_start, allowed_tracks).
+# Notes whose onset falls in [in_start, in_end) are shifted to out_start + (t - in_start)
+# (ends clipped to the window); ``allowed_tracks=None`` admits every track.
+_Window = tuple[int, int, int, "frozenset[int] | None"]
+
+
+def _append_window(
+    windows: list[_Window], in0: int, in1: int, offset: int, tracks: frozenset | None
+) -> int:
+    """Add a window (merging into the previous one when seamless); return new offset."""
+    if windows and windows[-1][1] == in0 and windows[-1][3] == tracks:
+        prev = windows[-1]
+        windows[-1] = (prev[0], in1, prev[2], tracks)
+    else:
+        windows.append((in0, in1, offset, tracks))
+    return offset + (in1 - in0)
+
+
+def _slice_notes_to_windows(
+    notes: list[list], windows: list[_Window], track_index: int
+) -> list[list]:
+    """Keep notes whose onset falls in a window admitting this track; concatenate."""
+    out: list[list] = []
+    for record in notes:
+        start, end = record[0], record[1]
+        for in0, in1, out0, allowed in windows:
+            if not in0 <= start < in1:
+                continue
+            if allowed is None or track_index in allowed:
+                new_start = start - in0 + out0
+                new_end = min(end, in1) - in0 + out0
+                if new_end > new_start:
+                    out.append([new_start, new_end, record[2], record[3], record[4]])
+            break  # windows don't overlap; the onset lives in exactly one
+    return out
+
+
 def _notes_to_track(notes: list[list]) -> Any:
     """Serialize note intervals back into a delta-time mido track."""
     events: list[tuple[int, int, Any]] = []
@@ -316,8 +353,13 @@ def _build_reduced_midi(
     mono_tracks: frozenset[int] = frozenset(),
     mono_min_fragment_ql: float = 0.125,
     quantize_divisors: Sequence[int] | None = None,
+    windows: list[_Window] | None = None,
 ) -> None:
-    """Write a MIDI containing only the given tracks plus a tempo/meta conductor."""
+    """Write a MIDI containing only the given tracks plus a tempo/meta conductor.
+
+    ``windows`` (original tick space) restricts the output to those spans,
+    concatenated; conductor state at the first window's start is carried to 0.
+    """
     orig = mido.MidiFile(str(src))
     reduced = mido.MidiFile(type=1, ticks_per_beat=orig.ticks_per_beat)
 
@@ -329,6 +371,21 @@ def _build_reduced_midi(
             if msg.is_meta and msg.type in _CONDUCTOR_META:
                 conductor_events.append((tick, msg.copy()))
     conductor_events.sort(key=lambda e: e[0])
+
+    if windows is not None:
+        state: dict[str, Any] = {}
+        sliced: list[tuple[int, Any]] = []
+        for tick, msg in conductor_events:
+            mapped = None
+            for in0, in1, out0, _ in windows:
+                if in0 <= tick < in1:
+                    mapped = tick - in0 + out0
+                    break
+            if mapped is not None:
+                sliced.append((mapped, msg))
+            elif tick <= windows[0][0]:
+                state[msg.type] = msg  # last state before the first window opens at 0
+        conductor_events = sorted([(0, msg) for msg in state.values()] + sliced, key=lambda e: e[0])
 
     conductor = mido.MidiTrack()
     last = 0
@@ -344,6 +401,8 @@ def _build_reduced_midi(
         if not (0 <= index < len(orig.tracks)):
             continue
         notes = _extract_notes(orig.tracks[index])
+        if windows is not None:
+            notes = _slice_notes_to_windows(notes, windows, index)
         if trim_overlap_ql:
             notes = _clean_overlaps(
                 notes,
@@ -391,6 +450,30 @@ def _tick_to_sec_fn(mid: Any) -> Any:
         return ssec + mido.tick2second(tick - stick, mid.ticks_per_beat, tempo)
 
     return tick_to_sec
+
+
+def _sec_to_tick_fn(mid: Any) -> Any:
+    """The inverse of :func:`_tick_to_sec_fn` (the tempo map is monotonic)."""
+    tick_to_sec = _tick_to_sec_fn(mid)
+    changes: list[tuple[int, int]] = []
+    for track in mid.tracks:
+        tick = 0
+        for msg in track:
+            tick += msg.time
+            if msg.is_meta and msg.type == "set_tempo":
+                changes.append((tick, msg.tempo))
+    changes.sort(key=lambda c: c[0])
+    if not changes or changes[0][0] != 0:
+        changes.insert(0, (0, 500000))
+    segments = [(tick, tick_to_sec(tick), tempo) for tick, tempo in changes]
+    start_secs = [s[1] for s in segments]
+
+    def sec_to_tick(sec: float) -> int:
+        i = max(0, bisect.bisect_right(start_secs, sec) - 1)
+        stick, ssec, tempo = segments[i]
+        return stick + round(mido.second2tick(max(0.0, sec - ssec), mid.ticks_per_beat, tempo))
+
+    return sec_to_tick
 
 
 class _BeatGrid:
@@ -460,6 +543,7 @@ def _build_beat_aligned_midi(
     mono_tracks: frozenset[int] = frozenset(),
     mono_min_fragment_ql: float = 0.125,
     quantize_divisors: Sequence[int] | None = None,
+    windows: list[_Window] | None = None,
 ) -> None:
     """Write a reduced MIDI retimed to the beat grid, with real tempo + time signature.
 
@@ -467,6 +551,10 @@ def _build_beat_aligned_midi(
     tracked beats), so a quarter note in the output is an actual beat of the music and
     bar 1 starts on the first downbeat. ``beat_shift`` (whole bars, in felt beats) makes
     room for pickup notes and must be identical across staves to keep them aligned.
+
+    ``windows`` (retimed-tick space, bar-aligned) restricts the output to those
+    spans, concatenated; the retimed ticks are left unclamped so that windows
+    starting before the first downbeat still slice correctly.
     """
     tick_to_sec = _tick_to_sec_fn(src)
     out = mido.MidiFile(type=1, ticks_per_beat=_EXPORT_TPB)
@@ -488,7 +576,8 @@ def _build_beat_aligned_midi(
 
     def new_tick(abs_tick: int) -> int:
         beat_pos = grid.pos(tick_to_sec(abs_tick)) + beat_shift
-        return max(0, round(beat_pos * grid.beat_ql * _EXPORT_TPB))
+        tick = round(beat_pos * grid.beat_ql * _EXPORT_TPB)
+        return tick if windows is not None else max(0, tick)
 
     for index in track_indices:
         if not (0 <= index < len(src.tracks)):
@@ -497,6 +586,8 @@ def _build_beat_aligned_midi(
         for record in notes:
             record[0] = new_tick(record[0])
             record[1] = max(record[0] + 1, new_tick(record[1]))
+        if windows is not None:
+            notes = _slice_notes_to_windows(notes, windows, index)
         if trim_overlap_ql:
             notes = _clean_overlaps(
                 notes,
@@ -527,6 +618,7 @@ def _staff_part(
     trim_overlap_ql: float | None = None,
     mono_tracks: frozenset[int] = frozenset(),
     mono_min_fragment_ql: float = 0.125,
+    windows: list[_Window] | None = None,
 ) -> Any:
     """Build one chordified staff (a music21 Part) from the given tracks."""
     # music21's MIDI parser quantizes on import, so the grid must be set at parse time
@@ -546,6 +638,7 @@ def _staff_part(
                 mono_tracks=mono_tracks,
                 mono_min_fragment_ql=mono_min_fragment_ql,
                 quantize_divisors=quantize_divisors,
+                windows=windows,
             )
         else:
             _build_reduced_midi(
@@ -556,6 +649,7 @@ def _staff_part(
                 mono_tracks=mono_tracks,
                 mono_min_fragment_ql=mono_min_fragment_ql,
                 quantize_divisors=quantize_divisors,
+                windows=windows,
             )
         if quantize_divisors:
             # already snapped to the grid in tick space (see _snap_to_grid); music21's
@@ -625,6 +719,7 @@ def export_to_staff(
     trim_overlaps: bool = True,
     mono_tracks: frozenset[int] | set[int] = frozenset(),
     title: str | None = None,
+    sections: Sequence[dict] | None = None,
 ) -> dict[str, Path]:
     """Export the chosen tracks of ``midi_path`` to notation files in ``out_dir``.
 
@@ -637,8 +732,16 @@ def export_to_staff(
 
     ``meter`` is a detected-meter artifact (from ``<song>.meter.json``). When it carries
     a beat grid, notes are retimed to it: the output gets the real tempo and time
-    signature, and bar 1 is anchored on the first downbeat. Returns a mapping of
-    produced format -> path (and "abc_error" if ABC could not be produced).
+    signature, and bar 1 is anchored on the first downbeat.
+
+    ``sections`` cuts the export to song sections: a time-ordered list of
+    ``{"start": seconds, "end": seconds, "tracks": iterable[int] | None}``. Each
+    window is snapped to whole bars of the beat grid (when ``meter`` is applied)
+    and the windows are concatenated; a window's ``tracks`` restricts which of the
+    staff's tracks sound in it (``None`` = all of them).
+
+    Returns a mapping of produced format -> path (and "abc_error" if ABC could not
+    be produced).
     """
     midi_path = Path(midi_path)
     out_dir = Path(out_dir)
@@ -665,6 +768,42 @@ def export_to_staff(
     else:
         meter = None  # no usable beat grid -> plain export
 
+    windows: list[_Window] | None = None
+    if sections:
+        ordered = sorted(
+            (s for s in sections if float(s["end"]) > float(s["start"])),
+            key=lambda s: float(s["start"]),
+        )
+        windows = []
+        offset = 0
+        if grid is not None:
+            # Section boundaries are approximate; snap them to whole bars so the
+            # cuts are clean and every window starts on a downbeat. Windows are
+            # bar-anchored themselves, so the global pickup shift is not needed.
+            beat_shift = 0.0
+            bar = grid.felt_per_bar
+
+            def beat_tick(beats: float) -> int:
+                return round(beats * grid.beat_ql * _EXPORT_TPB)
+
+            for s in ordered:
+                b0 = round(grid.pos(float(s["start"])) / bar) * bar
+                b1 = round(grid.pos(float(s["end"])) / bar) * bar
+                if b1 <= b0:
+                    continue
+                tracks = frozenset(s["tracks"]) if s.get("tracks") is not None else None
+                offset = _append_window(windows, beat_tick(b0), beat_tick(b1), offset, tracks)
+        else:
+            sec_to_tick = _sec_to_tick_fn(mido.MidiFile(str(midi_path)))
+            for s in ordered:
+                t0, t1 = sec_to_tick(float(s["start"])), sec_to_tick(float(s["end"]))
+                if t1 <= t0:
+                    continue
+                tracks = frozenset(s["tracks"]) if s.get("tracks") is not None else None
+                offset = _append_window(windows, t0, t1, offset, tracks)
+        if not windows:
+            raise ValueError("The selected sections are shorter than one bar; nothing to export.")
+
     trim_overlap_ql = _overlap_threshold_ql(quantize_divisors) if trim_overlaps else None
     grid_unit = 1.0 / max(quantize_divisors) if quantize_divisors else 0.25
 
@@ -681,6 +820,7 @@ def export_to_staff(
             trim_overlap_ql=trim_overlap_ql,
             mono_tracks=frozenset(mono_tracks),
             mono_min_fragment_ql=grid_unit / 2,
+            windows=windows,
         )
         for i, tracks in enumerate(staves)
     ]

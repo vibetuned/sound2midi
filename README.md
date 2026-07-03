@@ -21,13 +21,15 @@ flowchart LR
 
     WAV -->|"S-KEY"| KEY["key.json"]
     WAV -->|"Beat This!"| METER["meter.json<br/>tempo + time signature + beat grid"]
+    WAV -->|"--sections: SongFormer"| SECTIONS["sections.json<br/>intro/verse/chorus segments"]
 
     MID --> PLAYER
     MERGED --> PLAYER
     KEY --> PLAYER
     METER --> PLAYER
+    SECTIONS --> PLAYER
 
-    subgraph PLAYER["sound2midi-play — FluidSynth 🔊, piano roll, solo/mute"]
+    subgraph PLAYER["sound2midi-play — FluidSynth 🔊, piano roll, solo/mute, section loop"]
         SEL["staff assignment (1/2) · 1v single-voice ·<br/>legato trim · quantize grid · key/meter toggles"]
     end
 
@@ -71,6 +73,7 @@ output/<song>/
   <song>.stems.mid   # merged stem transcription (with --stems)
   <song>.key.json    # detected musical key (skey)
   <song>.meter.json  # detected tempo + time signature + beat grid (beat-this)
+  <song>.sections.json  # song structure segments (SongFormer, with --sections)
   stems/             # stem intermediates (separated WAVs + per-stem MIDIs)
 ```
 
@@ -140,6 +143,32 @@ MIDI's between-beat onsets to duple vs triple grids (a triple majority turns 2/4
 beat alignment. Pass `--no-meter` to skip. Like skey, it installs into the AMT venv on
 first use (plain PyTorch, no madmom).
 
+### Song structure detection (`--sections`)
+
+Opt-in (it is the heaviest artifact): [SongFormer](https://github.com/ASLP-lab/SongFormer)
+(ASLP-lab, state of the art in music structure analysis) segments the full mix into
+labeled sections — intro, verse, pre-chorus, chorus, bridge, inst, outro, silence
+(the SongForm-HX-8Class label set) — saved to `<song>.sections.json` as
+`{"segments": [{"label": "chorus", "start": 45.2, "end": 78.9}, ...]}`.
+
+```bash
+uv run sound2midi VIDEO_ID --sections
+```
+
+SongFormer is a script-based repo (like the AMT project) that vendors MusicFM and
+pins `torch==2.4.0`, which has no Blackwell (RTX 50) kernels — so unlike skey and
+beat-this it does **not** ride the AMT venv. On first use it is cloned into its own
+cache directory (`$SOUND2MIDI_SONGFORMER_HOME`, default
+`~/.cache/sound2midi/songformer`) with its own uv venv built against the same
+`torch==2.7.0+cu128` the AMT venv uses, and its checkpoints (SongFormer, MusicFM,
+MuQ — several GB total) are downloaded. Inference itself takes a few seconds per
+song on GPU; if CUDA is unavailable or unusable it falls back to CPU (slow but
+fine for a one-time artifact).
+
+In the player the artifact appears as a clickable **section strip** above the
+instrument lanes (see below); section-scoped export and backing tracks are on the
+Roadmap.
+
 ## Play (`sound2midi-play`)
 
 A small PySide6 app that synthesizes a MIDI with FluidSynth and shows a **per-instrument
@@ -156,6 +185,16 @@ uv run sound2midi-play song.mid --soundfont /path/to/sf.sf2 --driver pulseaudio
 
 - **Play / Pause / Stop**, a seek bar, master volume. Click anywhere on a lane to seek.
 - Per-lane **Solo / Mute** (plus *Clear solo* / *Unmute all*); muted/non-soloed lanes dim.
+- If a `<song>.sections.json` is present (from `--sections`), a **section strip** sits
+  above the lanes: one colored block per detected section, repeats numbered (Verse 1,
+  Chorus 2, …). Click sections to select them (click again to deselect): playback
+  **loops the selection**, playing the selected sections in song order and skipping the
+  gaps (a ⟳ indicator shows in the header), and exports are **cut to it**. Combined
+  with Solo/Mute that covers "practice the guitar part over chorus 2".
+- **Ctrl+click** an instrument's lane inside a section to toggle that
+  (instrument, section) **cell** — "this instrument plays in this part" — shown as a
+  tint in the track's color. Cells pick instruments per section for the export; a
+  cell'd instrument doesn't need its staff box ticked (it defaults to staff 1).
 - Soundfont search order: `--soundfont`, then `$SOUND2MIDI_SOUNDFONT`, then common system
   paths. Audio driver auto-selects; override with `--driver` or `$SOUND2MIDI_FLUID_DRIVER`.
 
@@ -203,6 +242,14 @@ downbeat** (pickup notes get whole leading bars, identical across both staves). 
 this, the MIDI's flat default tempo (120) makes barlines and rhythm values arbitrary;
 with it, a "1/16" on the grid selector is an actual sixteenth of the music.
 
+**Section-scoped export**: when sections are selected in the strip (or cells are set),
+the export is cut to them — with Meter on, each section is snapped to whole bars of the
+beat grid, and the windows are concatenated in song order so the score reads as one
+continuous excerpt. Per-section cells decide which instruments sound in each window
+(a section without cells uses all staff-ticked instruments). The output gets a
+`.sections` name suffix. With no strip selection, the sections that have cells form
+the export window.
+
 The score is reduced to just **pitch + rhythm on a single Piano instrument** — the source
 tracks' MIDI programs/channels are stripped, so there are no stray "instrument change"
 entries cluttering (or breaking) the MusicXML.
@@ -226,12 +273,15 @@ set `$SOUND2MIDI_XML2ABC` to point elsewhere). Conversion uses [music21](https:/
 | `--no-amp` / `--amp-dtype` | Control mixed precision (default: on, `bf16`) |
 | `--no-key` | Skip key detection (on by default; saved to `<song>.key.json`) |
 | `--no-meter` | Skip tempo/time-signature detection (on by default; saved to `<song>.meter.json`) |
+| `--sections` | Detect song structure with SongFormer (opt-in; saved to `<song>.sections.json`) |
 | `--amt-home` | Where to keep the AMT checkout + venv |
 | `--reinstall` | Rebuild the AMT venv from scratch |
 | `--infer-arg` | Forward a raw flag to `infer.py` (repeatable) |
 
 `$SOUND2MIDI_AMT_HOME` also sets the AMT location
-(default: `~/.cache/sound2midi/instrument-agnostic-amt`).
+(default: `~/.cache/sound2midi/instrument-agnostic-amt`), and
+`$SOUND2MIDI_SONGFORMER_HOME` the SongFormer location
+(default: `~/.cache/sound2midi/songformer`).
 
 ## Development
 
@@ -250,8 +300,13 @@ Layout:
 - `src/sound2midi/_amt/key_detect.py` — runs **inside the AMT venv**; skey key detection.
 - `src/sound2midi/_amt/meter_detect.py` — runs **inside the AMT venv**; Beat This! beat
   tracking + meter/tempo inference.
-- `src/sound2midi/player/` — FluidSynth playback `engine`, `pianoroll` lanes, `export`
-  (beat-aligned music21 → MusicXML/ABC), PySide6 window.
+- `src/sound2midi/sections.py` — manage the SongFormer checkout/venv (same pattern as
+  `amt.py`); song-structure detection entry point.
+- `src/sound2midi/_songformer/sections_detect.py` — runs **inside the SongFormer venv**;
+  headless port of SongFormer's single-file inference (excluded from lint/type-check).
+- `src/sound2midi/player/` — FluidSynth playback `engine`, `pianoroll` lanes,
+  `sectionstrip` (clickable song-structure strip + loop), `export` (beat-aligned
+  music21 → MusicXML/ABC), PySide6 window.
 
 ## Roadmap
 
@@ -264,7 +319,9 @@ Planned artifacts, mainly to feed [midi-stroke](https://github.com/vibetuned/mid
 - **Background-music export** — render "everything except the practiced instrument" to
   audio as a backing track (the player engine's offline renderer already honors
   solo/mute, so this is a thin feature on top of the stems).
-- More per-song artifacts (chords, sections, …) as midi-stroke needs them.
+- **Section-scoped backing tracks** — apply the section cut to the backing-track
+  render as well (the notation export already supports it).
+- More per-song artifacts (chords, …) as midi-stroke needs them.
 
 ## References
 
@@ -276,6 +333,7 @@ Models and papers this pipeline builds on:
 | Stem separation | [stem-splitter](https://pypi.org/project/stem-splitter/) (BS-RoFormer) | Lu et al., *Music Source Separation with Band-Split RoPE Transformer*, ICASSP 2024 |
 | Key detection | [deezer/skey](https://github.com/deezer/skey) | Kong et al., *S-KEY: Self-Supervised Learning of Major and Minor Keys from Audio*, ICASSP 2025; predecessor [deezer/stone](https://github.com/deezer/stone), *STONE: Self-Supervised Tonality Estimator*, ISMIR 2024 |
 | Beat/downbeat tracking | [CPJKU/beat_this](https://github.com/CPJKU/beat_this) | Foscarin, Schlüter, Widmer, *Beat This! Accurate Beat Tracking Without DBN Postprocessing*, ISMIR 2024 |
+| Song structure (sections) | [ASLP-lab/SongFormer](https://github.com/ASLP-lab/SongFormer) | Hao et al., *SongFormer: Scaling Music Structure Analysis with Heterogeneous Supervision*, arXiv 2025 |
 
 Tooling: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [music21](https://github.com/cuthbertLab/music21)
 (MIT, Cuthbert et al.), [mido](https://github.com/mido/mido),

@@ -18,6 +18,7 @@ from sound2midi.amt import (
     transcribe_stems,
 )
 from sound2midi.download import download_audio, probe_id
+from sound2midi.sections import default_songformer_home, detect_sections
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -135,6 +136,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Skip tempo/time-signature detection (runs by default via beat-this, "
         "saved as <song>.meter.json).",
+    )
+    parser.add_argument(
+        "--sections",
+        action="store_true",
+        help="Detect song structure (intro/verse/chorus/...) with SongFormer, saved as "
+        "<song>.sections.json. Opt-in: first use clones SongFormer into its own cached "
+        "venv and downloads several GB of checkpoints.",
     )
     parser.add_argument(
         "-f",
@@ -268,5 +276,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Meter detection failed: {exc}", file=sys.stderr)
         elif not args.quiet:
             print(f"Meter already detected: {meter_json}")
+
+    if args.sections:
+        sections_json = song_dir / f"{song_name}.sections.json"
+        if args.force or not sections_json.exists():
+            if not args.quiet:
+                print("Detecting song structure (SongFormer) ...")
+            try:
+                sections = detect_sections(
+                    audio_path,
+                    home=default_songformer_home(),
+                    device=args.device,
+                    output_json=sections_json,
+                )
+                print(f"Detected sections: {sections['structure']}  (saved to {sections_json})")
+            except Exception as exc:  # non-fatal: don't lose the transcription
+                print(f"Section detection failed: {exc}", file=sys.stderr)
+        elif not args.quiet:
+            print(f"Sections already detected: {sections_json}")
 
     return 0

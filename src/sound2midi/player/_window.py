@@ -26,6 +26,11 @@ from PySide6.QtWidgets import (
 from sound2midi.player.engine import PlayerEngine, polyphony_ratio
 from sound2midi.player.export import export_to_staff
 from sound2midi.player.pianoroll import InstrumentLane
+from sound2midi.player.sectionstrip import Section, SectionLane, build_sections
+
+# When looping a section, wrap if the playhead is within this many seconds past
+# its end (the tick timer samples every 80 ms; a seek can overshoot further).
+_LOOP_GRACE = 1.0
 
 
 def _fmt_time(seconds: float) -> str:
@@ -47,6 +52,10 @@ class PlayerWindow(QMainWindow):
 
         self._dragging = False
         self._lanes: list[InstrumentLane] = []
+        self._sections: list[Section] = []
+        self._section_lane: SectionLane | None = None
+        self._selected_sections: list[int] = []  # strip selection (section indices)
+        self._loops: list[tuple[float, float]] = []  # playback windows, in song order
         self._detected_key: str | None = None
         self._detected_meter: dict | None = None
         self._build_ui()
@@ -88,36 +97,35 @@ class PlayerWindow(QMainWindow):
         transport.addWidget(self.stop_btn)
         transport.addWidget(self.position, 1)
         transport.addWidget(self.time_label)
-        root.addLayout(transport)
-
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Volume"))
+        transport.addSpacing(12)
+        transport.addWidget(QLabel("Volume"))
         self.gain = QSlider(Qt.Orientation.Horizontal)
         self.gain.setRange(0, 150)
         self.gain.setValue(int(self.engine.gain * 100))
         self.gain.setMaximumWidth(160)
         self.gain.valueChanged.connect(lambda v: self.engine.set_gain(v / 100.0))
-        controls.addWidget(self.gain)
-        controls.addStretch(1)
+        transport.addWidget(self.gain)
         clear_solo = QPushButton("Clear solo")
         clear_solo.clicked.connect(self._clear_solo)
         unmute = QPushButton("Unmute all")
         unmute.clicked.connect(self._unmute_all)
-        controls.addWidget(clear_solo)
-        controls.addWidget(unmute)
-        root.addLayout(controls)
+        transport.addWidget(clear_solo)
+        transport.addWidget(unmute)
+        root.addLayout(transport)
 
-        export = QHBoxLayout()
-        export.addWidget(QLabel("Export staff:"))
+        # Export controls, split over two rows: how the score is built, then
+        # what goes into it and the output formats.
+        export1 = QHBoxLayout()
+        export1.addWidget(QLabel("Export staff:"))
         self.staff_mode = QComboBox()
         self.staff_mode.addItem("Single staff", "single")
         self.staff_mode.addItem("Grand staff (2)", "grand")
         self.staff_mode.currentIndexChanged.connect(self._sync_export_controls)
-        export.addWidget(self.staff_mode)
+        export1.addWidget(self.staff_mode)
         self.staff_hint = QLabel("tick ① to include")
         self.staff_hint.setStyleSheet("color: #888;")
-        export.addWidget(self.staff_hint)
-        export.addWidget(QLabel("Grid:"))
+        export1.addWidget(self.staff_hint)
+        export1.addWidget(QLabel("Grid:"))
         self.grid_combo = QComboBox()
         self.grid_combo.setToolTip("Notation quantization grid (coarser = cleaner, fewer tuplets)")
         self.grid_combo.addItem("1/4", (1,))
@@ -127,20 +135,7 @@ class PlayerWindow(QMainWindow):
         self.grid_combo.addItem("1/8 + triplets", (2, 3))
         self.grid_combo.addItem("1/16 + triplets", (4, 3))
         self.grid_combo.setCurrentIndex(2)  # 1/16 grid: clean default
-        export.addWidget(self.grid_combo)
-        self.apply_key_box = QCheckBox("Key: —")
-        self.apply_key_box.setEnabled(False)
-        self.apply_key_box.setToolTip(
-            "Apply the detected key signature (from <song>.key.json) to the exported score"
-        )
-        export.addWidget(self.apply_key_box)
-        self.apply_meter_box = QCheckBox("Meter: —")
-        self.apply_meter_box.setEnabled(False)
-        self.apply_meter_box.setToolTip(
-            "Retime the export to the detected beat grid (from <song>.meter.json): real "
-            "tempo + time signature, bars anchored on downbeats"
-        )
-        export.addWidget(self.apply_meter_box)
+        export1.addWidget(self.grid_combo)
         self.trim_box = QCheckBox("Legato trim")
         self.trim_box.setChecked(True)
         self.trim_box.setToolTip(
@@ -148,19 +143,36 @@ class PlayerWindow(QMainWindow):
             "turn into sliver chords (A → C becoming A/[A C]/C). Real chords and long "
             "suspensions are kept."
         )
-        export.addWidget(self.trim_box)
+        export1.addWidget(self.trim_box)
+        export1.addStretch(1)
+        root.addLayout(export1)
+
+        export2 = QHBoxLayout()
+        self.apply_key_box = QCheckBox("Key: —")
+        self.apply_key_box.setEnabled(False)
+        self.apply_key_box.setToolTip(
+            "Apply the detected key signature (from <song>.key.json) to the exported score"
+        )
+        export2.addWidget(self.apply_key_box)
+        self.apply_meter_box = QCheckBox("Meter: —")
+        self.apply_meter_box.setEnabled(False)
+        self.apply_meter_box.setToolTip(
+            "Retime the export to the detected beat grid (from <song>.meter.json): real "
+            "tempo + time signature, bars anchored on downbeats"
+        )
+        export2.addWidget(self.apply_meter_box)
         self.fmt_musicxml = QCheckBox("MusicXML")
         self.fmt_musicxml.setChecked(True)
         self.fmt_abc = QCheckBox("ABC")
         self.fmt_abc.setChecked(True)
-        export.addWidget(self.fmt_musicxml)
-        export.addWidget(self.fmt_abc)
-        export.addStretch(1)
+        export2.addWidget(self.fmt_musicxml)
+        export2.addWidget(self.fmt_abc)
+        export2.addStretch(1)
         self.export_btn = QPushButton("Export selected →")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export)
-        export.addWidget(self.export_btn)
-        root.addLayout(export)
+        export2.addWidget(self.export_btn)
+        root.addLayout(export2)
         self._sync_export_controls()
 
         self.lane_area = QScrollArea()
@@ -189,6 +201,15 @@ class PlayerWindow(QMainWindow):
         self.file_label.setStyleSheet("")
         self.setWindowTitle(f"sound2midi player — {path.name}")
 
+        # Sections (from <song>.sections.json, written by --sections) come first:
+        # the lanes need the boundaries for their per-section export cells.
+        sections_data = self._load_artifact(path, "sections")
+        segments = sections_data.get("segments") if sections_data else None
+        self._sections = build_sections(segments) if isinstance(segments, list) else []
+        self._selected_sections = []
+        self._loops = []
+        section_spans = [(s.start, s.end) for s in self._sections]
+
         for lane in self._lanes:
             lane.setParent(None)
             lane.deleteLater()
@@ -207,9 +228,23 @@ class PlayerWindow(QMainWindow):
                 on_seek=self._after_seek,
                 on_toggle=self._refresh_lanes,
                 mono_default=mono_default,
+                sections=section_spans,
             )
             self._lanes.append(lane)
             self.lane_layout.insertWidget(self.lane_layout.count() - 1, lane)
+
+        if self._section_lane is not None:
+            self._section_lane.setParent(None)
+            self._section_lane.deleteLater()
+            self._section_lane = None
+        if self._sections:
+            self._section_lane = SectionLane(
+                self._sections,
+                self.engine,
+                on_seek=self._after_seek,
+                on_selection=self._on_sections_selected,
+            )
+            self.lane_layout.insertWidget(0, self._section_lane)
 
         self._detected_key = self._load_key(path)
         if self._detected_key:
@@ -295,6 +330,13 @@ class PlayerWindow(QMainWindow):
         self._update_time()
 
     def _on_finished(self) -> None:
+        if self._loops and self.engine.duration > 0:
+            # A looped final section runs into the end of the song; wrap around.
+            self.engine.seek(self._loops[0][0])
+            self.engine.play()
+            self.play_btn.setText("Pause")
+            self._refresh_playheads()
+            return
         self.play_btn.setText("Play")
         self.position.setValue(0)
         self._refresh_playheads()
@@ -316,6 +358,18 @@ class PlayerWindow(QMainWindow):
         self._update_time()
         if self.engine.playing:
             self.play_btn.setText("Pause")
+
+    def _on_sections_selected(self, indices: list[int]) -> None:
+        self._selected_sections = list(indices)
+        duration = self.engine.duration
+        loops = []
+        for i in indices:
+            section = self._sections[i]
+            # A section entirely past the MIDI's end (the audio can outlast the
+            # transcription) has nothing to loop.
+            if section.start < duration:
+                loops.append((section.start, min(section.end, duration)))
+        self._loops = loops
 
     def _clear_solo(self) -> None:
         self.engine.clear_solo()
@@ -343,18 +397,49 @@ class PlayerWindow(QMainWindow):
         if midi is None:
             return
         grand = self.staff_mode.currentData() == "grand"
+        # A track is exported if a staff box is ticked — or if it has section
+        # cells (Ctrl+click on its lane), which put it on staff 1 unless it is
+        # explicitly assigned to staff 2.
+        cell_map = {lane.track.index: lane.cells() for lane in self._lanes}
         if grand:
             staves = [
-                [lane.track.index for lane in self._lanes if lane.on_staff1()],
+                [
+                    lane.track.index
+                    for lane in self._lanes
+                    if lane.on_staff1() or (cell_map[lane.track.index] and not lane.on_staff2())
+                ],
                 [lane.track.index for lane in self._lanes if lane.on_staff2()],
             ]
         else:
-            staves = [[lane.track.index for lane in self._lanes if lane.on_staff1()]]
+            staves = [
+                [
+                    lane.track.index
+                    for lane in self._lanes
+                    if lane.on_staff1() or cell_map[lane.track.index]
+                ]
+            ]
         if not any(staves):
             QMessageBox.information(
-                self, "Export", "Tick a staff checkbox on one or more instruments first."
+                self,
+                "Export",
+                "Tick a staff checkbox on one or more instruments first "
+                "(or Ctrl+click sections on their lanes).",
             )
             return
+
+        # Export window = the sections selected in the strip; else the sections
+        # that have cells; else the whole song.
+        section_indices = list(self._selected_sections)
+        if not section_indices:
+            section_indices = sorted({i for cells in cell_map.values() for i in cells})
+        sections_arg = [
+            {
+                "start": self._sections[i].start,
+                "end": self._sections[i].end,
+                "tracks": ({t for t, cells in cell_map.items() if i in cells} or None),
+            }
+            for i in section_indices
+        ] or None
 
         formats = []
         if self.fmt_musicxml.isChecked():
@@ -368,7 +453,7 @@ class PlayerWindow(QMainWindow):
         mode = "grand" if grand else "single"
         midi_path = Path(midi)
         out_dir = midi_path.parent
-        basename = f"{midi_path.stem}.{mode}"
+        basename = f"{midi_path.stem}.{mode}" + (".sections" if sections_arg else "")
         quantize_divisors = self.grid_combo.currentData()
         formats_tuple = tuple(formats)
         apply_key = self.apply_key_box.isChecked() and self._detected_key
@@ -395,6 +480,7 @@ class PlayerWindow(QMainWindow):
                     trim_overlaps=trim_overlaps,
                     mono_tracks=mono_tracks,
                     title=midi_path.stem,
+                    sections=sections_arg,
                 )
                 self.export_done.emit(result)
             except Exception as exc:  # delivered to the GUI thread via the signal
@@ -418,9 +504,25 @@ class PlayerWindow(QMainWindow):
     def _refresh_playheads(self) -> None:
         for lane in self._lanes:
             lane.refresh_playhead()
+        if self._section_lane is not None:
+            self._section_lane.refresh_playhead()
 
     # -- periodic update -------------------------------------------------
     def _tick(self) -> None:
+        if self._loops and self.engine.playing:
+            pos = self.engine.position()
+            # Play the selected sections in song order: crossing out of one jumps
+            # to the next (wrapping to the first). Only a crossing triggers — a
+            # deliberate seek far outside (beyond the grace window) is left alone.
+            inside = any(start <= pos < end for start, end in self._loops)
+            crossed = any(end <= pos < end + _LOOP_GRACE for _, end in self._loops)
+            if not inside and crossed:
+                target = min(
+                    (start for start, _ in self._loops if start > pos),
+                    default=self._loops[0][0],
+                )
+                self.engine.seek(target)
+                self._refresh_playheads()
         if not self._dragging and self.engine.duration > 0:
             frac = self.engine.position() / self.engine.duration
             self.position.setValue(int(frac * 1000))

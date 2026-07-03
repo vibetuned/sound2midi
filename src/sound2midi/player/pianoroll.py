@@ -3,6 +3,11 @@
 Each instrument gets an :class:`InstrumentLane`: a control box (name + Solo/Mute) next
 to a :class:`NoteStrip` that draws that track's notes over time (gaps between notes are
 the rests). A red playhead sweeps across during playback; clicking a strip seeks.
+
+When the song has detected sections, each strip also shows the section boundaries,
+and Ctrl+clicking inside a section toggles that (instrument, section) **cell** —
+"this instrument plays in this section" — used to pick instruments per part for
+the notation export. Selected cells are tinted in the track's color.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ _SOLO_STYLE = "QPushButton:checked { background: #2e7d32; color: white; }"
 _MUTE_STYLE = "QPushButton:checked { background: #c62828; color: white; }"
 
 _GRID = QColor(70, 70, 76)
+_SECTION_EDGE = QColor(98, 98, 108)
 _PLAYHEAD = QColor(255, 80, 80)
 _LANE_BG = QColor(43, 43, 48)
 _LANE_BG_MUTED = QColor(30, 30, 33)
@@ -40,15 +46,22 @@ class NoteStrip(QWidget):
         engine: PlayerEngine,
         n_tracks: int,
         on_seek: Callable[[], None] | None = None,
+        sections: list[tuple[float, float]] | None = None,
     ) -> None:
         super().__init__()
         self.track = track
         self.engine = engine
         self.color = track_color(track.index, n_tracks)
+        self.sections = sections or []  # (start, end) per song section, in order
+        self.cells: set[int] = set()  # section indices this instrument is picked for
         self._on_seek = on_seek
         self._cache: QPixmap | None = None
         self.setMinimumHeight(26)
         self.setMinimumWidth(160)
+        if self.sections:
+            self.setToolTip(
+                "Click: seek · Ctrl+click: toggle this instrument for that section in the export"
+            )
 
         pitches = [p for _, _, p in track.notes]
         self._pmin = min(pitches) if pitches else 60
@@ -70,6 +83,15 @@ class NoteStrip(QWidget):
         painter = QPainter(pm)
         duration = self.engine.duration or 1.0
 
+        # tint the sections this instrument is picked for (export cells)
+        for i in self.cells:
+            start, end = self.sections[i]
+            x0 = start / duration * w
+            x1 = min(end, duration) / duration * w
+            tint = QColor(self.color)
+            tint.setAlpha(48 if audible else 24)
+            painter.fillRect(QRectF(x0, 0, x1 - x0, h), tint)
+
         # faint 10-second gridlines for time reference
         painter.setPen(QPen(_GRID, 1))
         step = 10.0
@@ -78,6 +100,14 @@ class NoteStrip(QWidget):
             x = int(t / duration * w)
             painter.drawLine(x, 0, x, h)
             t += step
+
+        # section boundaries, slightly brighter than the time grid
+        if self.sections:
+            painter.setPen(QPen(_SECTION_EDGE, 1))
+            for start, _end in self.sections:
+                if 0 < start < duration:
+                    x = int(start / duration * w)
+                    painter.drawLine(x, 0, x, h)
 
         note_color = QColor(self.color)
         if not audible:
@@ -115,11 +145,20 @@ class NoteStrip(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         duration = self.engine.duration
-        if duration > 0:
-            self.engine.seek(event.position().x() / max(1, self.width()) * duration)
-            if self._on_seek is not None:
-                self._on_seek()
-            self.update()
+        if duration <= 0:
+            return
+        seconds = event.position().x() / max(1, self.width()) * duration
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and self.sections:
+            for i, (start, end) in enumerate(self.sections):
+                if start <= seconds < end:
+                    self.cells.symmetric_difference_update({i})
+                    self.invalidate()
+                    break
+            return
+        self.engine.seek(seconds)
+        if self._on_seek is not None:
+            self._on_seek()
+        self.update()
 
 
 class InstrumentLane(QFrame):
@@ -134,6 +173,7 @@ class InstrumentLane(QFrame):
         on_seek: Callable[[], None] | None = None,
         on_toggle: Callable[[], None] | None = None,
         mono_default: bool = False,
+        sections: list[tuple[float, float]] | None = None,
     ) -> None:
         super().__init__()
         self.track = track
@@ -193,7 +233,7 @@ class InstrumentLane(QFrame):
         crow.addWidget(self.solo_btn)
         crow.addWidget(self.mute_btn)
 
-        self.strip = NoteStrip(track, engine, n_tracks, on_seek=on_seek)
+        self.strip = NoteStrip(track, engine, n_tracks, on_seek=on_seek, sections=sections)
 
         layout.addWidget(control)
         layout.addWidget(self.strip, 1)
@@ -236,3 +276,7 @@ class InstrumentLane(QFrame):
 
     def is_mono(self) -> bool:
         return self.mono_box.isChecked()
+
+    def cells(self) -> set[int]:
+        """Section indices this instrument is picked for (Ctrl+click on the strip)."""
+        return set(self.strip.cells)
