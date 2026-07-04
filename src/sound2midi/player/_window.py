@@ -124,6 +124,12 @@ class PlayerWindow(QMainWindow):
         self.staff_mode = QComboBox()
         self.staff_mode.addItem("Single staff", "single")
         self.staff_mode.addItem("Grand staff (2)", "grand")
+        self.staff_mode.addItem("Split (auto)", "split")
+        self.staff_mode.setToolTip(
+            "Single: everything on one staff. Grand: you assign instruments to the "
+            "two staves. Split: one selection, split into treble/bass automatically "
+            "around a moving middle that follows the notes' pitch, bar by bar."
+        )
         self.staff_mode.currentIndexChanged.connect(self._sync_export_controls)
         export1.addWidget(self.staff_mode)
         self.staff_hint = QLabel("tick ① to include")
@@ -283,6 +289,7 @@ class PlayerWindow(QMainWindow):
                 build_chords(self._chords),
                 self.engine,
                 track_index=chord_track,
+                sections=section_spans,
                 on_seek=self._after_seek,
                 on_toggle=self._refresh_lanes,
                 on_style=self._on_chord_style,
@@ -322,15 +329,21 @@ class PlayerWindow(QMainWindow):
 
     @staticmethod
     def _load_artifact(midi_path: Path, suffix: str) -> dict | None:
-        """Find and read a sibling <song>.<suffix>.json artifact, if any."""
+        """Find and read the song's <song>.<suffix>.json artifact, if any.
+
+        Artifacts live in the song folder's ``artifacts/`` subfolder; the song
+        folder root is still searched for folders from before that layout.
+        """
         parent = midi_path.parent
         stem = midi_path.stem
-        candidates = [
-            parent / f"{parent.name}.{suffix}.json",
-            parent / f"{stem}.{suffix}.json",
-            parent / f"{stem.replace('.stems', '')}.{suffix}.json",
-            *sorted(parent.glob(f"*.{suffix}.json")),
-        ]
+        candidates = []
+        for folder in (parent / "artifacts", parent):
+            candidates += [
+                folder / f"{parent.name}.{suffix}.json",
+                folder / f"{stem}.{suffix}.json",
+                folder / f"{stem.replace('.stems', '')}.{suffix}.json",
+                *sorted(folder.glob(f"*.{suffix}.json")),
+            ]
         for path in candidates:
             if path.is_file():
                 try:
@@ -453,10 +466,15 @@ class PlayerWindow(QMainWindow):
 
     # -- export ----------------------------------------------------------
     def _sync_export_controls(self) -> None:
-        grand = self.staff_mode.currentData() == "grand"
-        self.staff_hint.setText(
-            "tick 1 (treble) / 2 (bass) per instrument" if grand else "tick 1 to include"
-        )
+        mode = str(self.staff_mode.currentData())
+        grand = mode == "grand"
+        if grand:
+            hint = "tick 1 (treble) / 2 (bass) · cells follow the 2-box, else staff 1"
+        elif mode == "split":
+            hint = "tick 1 to include — notes auto-split into treble/bass"
+        else:
+            hint = "tick 1 to include"
+        self.staff_hint.setText(hint)
         for lane in self._lanes:
             lane.set_grand_mode(grand)
         if self._chord_lane is not None:
@@ -466,7 +484,8 @@ class PlayerWindow(QMainWindow):
         midi = self.engine.song.path
         if midi is None:
             return
-        grand = self.staff_mode.currentData() == "grand"
+        mode = str(self.staff_mode.currentData())  # "single" | "grand" | "split"
+        grand = mode == "grand"
         # A track is exported if a staff box is ticked — or if it has section
         # cells (Ctrl+click on its lane), which put it on staff 1 unless it is
         # explicitly assigned to staff 2.
@@ -489,23 +508,26 @@ class PlayerWindow(QMainWindow):
                 ]
             ]
         # The realized chord track exports as a regular voice: its lane has the
-        # same staff checkboxes, and its notes are synthesized (not in the file).
+        # same staff checkboxes and section cells, and its notes are synthesized
+        # (not in the file).
         synth_tracks_arg = None
         chord_lane = self._chord_lane
         chord_track = chord_lane.track_index if chord_lane is not None else None
-        if (
-            chord_lane is not None
-            and chord_track is not None
-            and (chord_lane.on_staff1() or chord_lane.on_staff2())
-        ):
-            synth_tracks_arg = {chord_track: self._realize_chord_notes(chord_lane.chord_style())}
-            if grand:
-                if chord_lane.on_staff1():
+        chord_cells: set[int] = set()
+        if chord_lane is not None and chord_track is not None:
+            chord_cells = chord_lane.cells()
+            cell_map[chord_track] = chord_cells
+            if chord_lane.on_staff1() or chord_lane.on_staff2() or chord_cells:
+                synth_tracks_arg = {
+                    chord_track: self._realize_chord_notes(chord_lane.chord_style())
+                }
+                if grand:
+                    if chord_lane.on_staff1() or (chord_cells and not chord_lane.on_staff2()):
+                        staves[0].append(chord_track)
+                    if chord_lane.on_staff2():
+                        staves[1].append(chord_track)
+                else:
                     staves[0].append(chord_track)
-                if chord_lane.on_staff2():
-                    staves[1].append(chord_track)
-            else:
-                staves[0].append(chord_track)
 
         if not any(staves):
             QMessageBox.information(
@@ -516,11 +538,15 @@ class PlayerWindow(QMainWindow):
             )
             return
 
-        # Export window = the sections selected in the strip; else the sections
-        # that have cells; else the whole song.
-        section_indices = list(self._selected_sections)
-        if not section_indices:
-            section_indices = sorted({i for cells in cell_map.values() for i in cells})
+        # Export window = the union of the strip-selected sections and every
+        # section that has cells (whole song when both are empty). A section's
+        # cells pick its instruments; a section without cells uses the
+        # staff-ticked defaults. The strip selection is read straight off the
+        # widget so the export can never disagree with what is on screen.
+        strip_selected = (
+            set(self._section_lane.strip.selected) if self._section_lane is not None else set()
+        )
+        section_indices = sorted(strip_selected | {i for cells in cell_map.values() for i in cells})
         sections_arg = [
             {
                 "start": self._sections[i].start,
@@ -529,8 +555,9 @@ class PlayerWindow(QMainWindow):
             }
             for i in section_indices
         ] or None
-        if sections_arg and synth_tracks_arg and chord_track is not None:
-            # The chord voice has no cells; keep it in every cell-restricted window.
+        if sections_arg and synth_tracks_arg and chord_track is not None and not chord_cells:
+            # Chord voice staffed but without cells of its own: keep it in every
+            # cell-restricted window. (With cells, it follows them like any track.)
             for window in sections_arg:
                 tracks = window["tracks"]
                 if isinstance(tracks, set):
@@ -545,7 +572,6 @@ class PlayerWindow(QMainWindow):
             QMessageBox.information(self, "Export", "Choose at least one format (MusicXML/ABC).")
             return
 
-        mode = "grand" if grand else "single"
         midi_path = Path(midi)
         out_dir = midi_path.parent
         basename = f"{midi_path.stem}.{mode}" + (".sections" if sections_arg else "")
@@ -558,6 +584,26 @@ class PlayerWindow(QMainWindow):
         trim_overlaps = self.trim_box.isChecked()
         mono_tracks = frozenset(lane.track.index for lane in self._lanes if lane.is_mono())
         chords_arg = list(self._chords) if self.apply_chords_box.isChecked() else None
+
+        # Human summary of exactly what goes into this export, shown in the
+        # completion dialog — so the exported state is never a mystery.
+        names = {lane.track.index: lane.track.name for lane in self._lanes}
+        if chord_track is not None:
+            names[chord_track] = "Chords"
+        if sections_arg:
+            lines = []
+            for i, window in zip(section_indices, sections_arg, strict=True):
+                tracks = window["tracks"]
+                who = (
+                    ", ".join(names.get(t, str(t)) for t in sorted(tracks))
+                    if isinstance(tracks, set)
+                    else "all selected instruments"
+                )
+                lines.append(f"{self._sections[i].display}: {who}")
+            summary = "\n".join(lines)
+        else:
+            staffed = sorted({t for staff in staves for t in staff})
+            summary = "Whole song: " + ", ".join(names.get(t, str(t)) for t in staffed)
 
         self.export_btn.setEnabled(False)
         self.export_btn.setText("Exporting…")
@@ -579,8 +625,9 @@ class PlayerWindow(QMainWindow):
                     sections=sections_arg,
                     chords=chords_arg,
                     synth_tracks=synth_tracks_arg,
+                    split=(mode == "split"),
                 )
-                self.export_done.emit(result)
+                self.export_done.emit((result, summary))
             except Exception as exc:  # delivered to the GUI thread via the signal
                 self.export_done.emit(exc)
 
@@ -592,12 +639,16 @@ class PlayerWindow(QMainWindow):
         if isinstance(result, Exception):
             QMessageBox.critical(self, "Export failed", str(result))
             return
-        assert isinstance(result, dict)
+        assert isinstance(result, tuple)
+        files, summary = result
+        assert isinstance(files, dict) and isinstance(summary, str)
         lines = []
-        for key, path in result.items():
+        for key, path in files.items():
             label = "ABC (skipped)" if key == "abc_error" else key
             lines.append(f"{label}: {path}")
-        QMessageBox.information(self, "Export complete", "\n".join(lines))
+        QMessageBox.information(
+            self, "Export complete", "\n".join(lines) + "\n\nExported:\n" + summary
+        )
 
     def _refresh_playheads(self) -> None:
         for lane in self._lanes:

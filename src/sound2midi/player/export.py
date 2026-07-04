@@ -10,6 +10,7 @@ the vendored ``xml2abc.py`` on the MusicXML.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import itertools
 import math
 import os
@@ -341,6 +342,84 @@ def _synth_notes(events: SynthTrack, sec_to_out_tick: Any) -> list[list]:
     return notes
 
 
+# A pitch-split assignment: which side of the moving split point a staff keeps,
+# plus the split curve as (start_tick, split_pitch) steps (notes >= split are treble).
+PitchSplit = tuple[str, list[tuple[int, int]]]
+
+
+def _bucket_split(pitches: list[int], previous: int) -> int:
+    """Split pitch for one bar's note pitches (the full multiset — density counts).
+
+    A single tight cluster (range <= a fifth) goes wholly to the nearer staff, so
+    a melody crossing middle C is never sliced. Otherwise the bar is cut by a
+    1-D two-cluster fit (2-means): the boundary minimizing the within-cluster
+    squared error over *all* note events, so where the notes mass is decides the
+    hands — not just the extreme pitches. The previous bar's split is reused
+    only when it yields the identical partition (a steadier curve for free; it
+    can never strand notes on the wrong side).
+    """
+    ordered = sorted(pitches)
+    unique = sorted(set(ordered))
+
+    def one_side() -> int:  # whole bar to the staff nearer its mean pitch
+        mean = sum(ordered) / len(ordered)
+        return unique[0] if mean >= 60 else unique[-1] + 1
+
+    if len(unique) < 2 or unique[-1] - unique[0] <= 7:
+        return one_side()
+
+    def sse(values: list[int]) -> float:
+        mean = sum(values) / len(values)
+        return sum((v - mean) ** 2 for v in values)
+
+    best_i = 1
+    best_err = math.inf
+    for i in range(1, len(unique)):
+        low = [p for p in ordered if p <= unique[i - 1]]
+        high = [p for p in ordered if p >= unique[i]]
+        err = sse(low) + sse(high)
+        if err < best_err:
+            best_i, best_err = i, err
+
+    below, above = unique[best_i - 1], unique[best_i]
+    if above - below < 2:
+        return one_side()  # the two "clusters" touch; treat the bar as one hand
+    if below < previous <= above:
+        return previous  # identical partition; keep the curve steady
+    return (below + above + 1) // 2
+
+
+def _split_curve(notes: list[list], bar_ticks: int, *, default: int = 60) -> list[tuple[int, int]]:
+    """Per-bar moving split point over the given (output-tick-space) notes."""
+    if not notes:
+        return [(0, default)]
+    buckets: dict[int, list[int]] = {}
+    for record in notes:
+        buckets.setdefault(max(0, record[0]) // bar_ticks, []).append(record[2])
+    curve: list[tuple[int, int]] = []
+    split = default
+    for bucket in range(max(buckets) + 1):
+        pitches = buckets.get(bucket)
+        if pitches:  # empty bars carry the previous split forward
+            split = _bucket_split(pitches, split)
+        if not curve or curve[-1][1] != split:
+            curve.append((bucket * bar_ticks, split))
+    return curve
+
+
+def _split_side(notes: list[list], pitch_split: PitchSplit) -> list[list]:
+    """Keep the notes on this staff's side of the moving split point."""
+    side, curve = pitch_split
+    starts = [c[0] for c in curve]
+    treble = side == "treble"
+    kept = []
+    for record in notes:
+        i = max(0, bisect.bisect_right(starts, record[0]) - 1)
+        if (record[2] >= curve[i][1]) == treble:
+            kept.append(record)
+    return kept
+
+
 # A section window in some tick space: (in_start, in_end, out_start, allowed_tracks).
 # Notes whose onset falls in [in_start, in_end) are shifted to out_start + (t - in_start)
 # (ends clipped to the window); ``allowed_tracks=None`` admits every track.
@@ -376,6 +455,54 @@ def _slice_notes_to_windows(
                     out.append([new_start, new_end, record[2], record[3], record[4]])
             break  # windows don't overlap; the onset lives in exactly one
     return out
+
+
+def _gather_split_notes(
+    midi_path: Path,
+    tracks: Sequence[int],
+    *,
+    grid: _BeatGrid | None,
+    beat_shift: float,
+    windows: list[_Window] | None,
+    synth_tracks: dict[int, SynthTrack] | None,
+) -> list[list]:
+    """The selection's notes in the builders' output tick space, pre-cleanup.
+
+    Feeds the moving split-point curve: it mirrors the builders' time mapping
+    (retime/slice) but skips trim/mono/quantize, which move notes by less than
+    a grid slot and can't meaningfully change a per-bar pitch distribution.
+    """
+    src = mido.MidiFile(str(midi_path))
+    if grid is not None:
+        tick_to_sec = _tick_to_sec_fn(src)
+
+        def out_tick_sec(seconds: float) -> int:
+            tick = round((grid.pos(seconds) + beat_shift) * grid.beat_ql * _EXPORT_TPB)
+            return tick if windows is not None else max(0, tick)
+
+        def out_tick(tick: int) -> int:
+            return out_tick_sec(tick_to_sec(tick))
+    else:
+        out_tick_sec = _sec_to_tick_fn(src)
+
+        def out_tick(tick: int) -> int:
+            return tick
+
+    gathered: list[list] = []
+    for index in tracks:
+        if synth_tracks is not None and index in synth_tracks:
+            notes = _synth_notes(synth_tracks[index], out_tick_sec)
+        elif 0 <= index < len(src.tracks):
+            notes = _extract_notes(src.tracks[index])
+            for record in notes:
+                record[0] = out_tick(record[0])
+                record[1] = max(record[0] + 1, out_tick(record[1]))
+        else:
+            continue
+        if windows is not None:
+            notes = _slice_notes_to_windows(notes, windows, index)
+        gathered.extend(notes)
+    return gathered
 
 
 def _notes_to_track(notes: list[list]) -> Any:
@@ -480,12 +607,14 @@ def _build_reduced_midi(
     quantize_divisors: Sequence[int] | None = None,
     windows: list[_Window] | None = None,
     synth_tracks: dict[int, SynthTrack] | None = None,
+    pitch_split: PitchSplit | None = None,
 ) -> None:
     """Write a MIDI containing only the given tracks plus a tempo/meta conductor.
 
     ``windows`` (original tick space) restricts the output to those spans,
     concatenated; conductor state at the first window's start is carried to 0.
     ``synth_tracks`` maps out-of-file track indices to realized chord events.
+    ``pitch_split`` keeps only this staff's side of a moving split point.
     """
     orig = mido.MidiFile(str(src))
     reduced = mido.MidiFile(type=1, ticks_per_beat=orig.ticks_per_beat)
@@ -548,6 +677,8 @@ def _build_reduced_midi(
             )
         if quantize_divisors:
             notes = _snap_to_grid(notes, divisors=quantize_divisors, tpb=tpb)
+        if pitch_split is not None:
+            notes = _split_side(notes, pitch_split)
         reduced.tracks.append(_notes_to_track(notes))
 
     reduced.save(str(dest))
@@ -678,6 +809,7 @@ def _build_beat_aligned_midi(
     quantize_divisors: Sequence[int] | None = None,
     windows: list[_Window] | None = None,
     synth_tracks: dict[int, SynthTrack] | None = None,
+    pitch_split: PitchSplit | None = None,
 ) -> None:
     """Write a reduced MIDI retimed to the beat grid, with real tempo + time signature.
 
@@ -740,6 +872,8 @@ def _build_beat_aligned_midi(
             )
         if quantize_divisors:
             notes = _snap_to_grid(notes, divisors=quantize_divisors, tpb=_EXPORT_TPB)
+        if pitch_split is not None:
+            notes = _split_side(notes, pitch_split)
         out.tracks.append(_notes_to_track(notes))
 
     out.save(str(dest))
@@ -760,6 +894,7 @@ def _staff_part(
     mono_min_fragment_ql: float = 0.125,
     windows: list[_Window] | None = None,
     synth_tracks: dict[int, SynthTrack] | None = None,
+    pitch_split: PitchSplit | None = None,
 ) -> Any:
     """Build one chordified staff (a music21 Part) from the given tracks."""
     # music21's MIDI parser quantizes on import, so the grid must be set at parse time
@@ -781,6 +916,7 @@ def _staff_part(
                 quantize_divisors=quantize_divisors,
                 windows=windows,
                 synth_tracks=synth_tracks,
+                pitch_split=pitch_split,
             )
         else:
             _build_reduced_midi(
@@ -793,6 +929,7 @@ def _staff_part(
                 quantize_divisors=quantize_divisors,
                 windows=windows,
                 synth_tracks=synth_tracks,
+                pitch_split=pitch_split,
             )
         if quantize_divisors:
             # already snapped to the grid in tick space (see _snap_to_grid); music21's
@@ -801,6 +938,13 @@ def _staff_part(
             score = converter.parse(str(reduced_midi), quantizePost=False)
         else:
             score = converter.parse(str(reduced_midi))
+    # chordify() truncates the merged result at the FIRST part's end, so a staff
+    # whose first track stops early (common with section windows, where each
+    # window admits different tracks) would silently lose its tail. Pad every
+    # part to the longest with full-bar rests before merging.
+    score_parts = list(score.parts)
+    if len(score_parts) > 1:
+        _pad_to_equal_length(score_parts)
     part = score.chordify()
 
     # Drop MIDI/instrument metadata (programs, channels) that music21 carries over from the
@@ -865,11 +1009,20 @@ def export_to_staff(
     sections: Sequence[dict] | None = None,
     chords: Sequence[dict] | None = None,
     synth_tracks: dict[int, SynthTrack] | None = None,
+    split: bool = False,
 ) -> dict[str, Path]:
-    """Export the chosen tracks of ``midi_path`` to notation files in ``out_dir``.
+    """Export the chosen tracks of ``midi_path`` to notation files under ``out_dir``.
+
+    Outputs land in per-format subfolders: ``out_dir/musicxml/`` and
+    ``out_dir/abc/``.
 
     ``staves`` is one list of track indices per staff. One non-empty staff -> a single
     system; two -> a braced grand staff (staff 1 treble, staff 2 bass).
+
+    ``split`` takes a single selection (one staff list) and writes a grand staff
+    by splitting its notes into treble/bass around a **moving split point**: per
+    bar, a two-cluster fit over the bar's note events (density decides, not just
+    the extremes); a single tight cluster stays on one staff whole.
 
     ``quantize_divisors`` sets the notation grid as music21 quarter-length divisors,
     e.g. ``(4,)`` = 16th-note grid (clean, no tuplets), ``(4, 3)`` = 16ths + triplets,
@@ -903,8 +1056,10 @@ def export_to_staff(
     staves = [list(s) for s in staves if s]  # drop empty staves
     if not staves:
         raise ValueError("No instruments assigned to any staff.")
+    if split and len(staves) != 1:
+        raise ValueError("Split mode takes a single selection (one staff list).")
 
-    mode = "grand" if len(staves) >= 2 else "single"
+    mode = "split" if split else ("grand" if len(staves) >= 2 else "single")
     basename = basename or f"{midi_path.stem}.{mode}"
 
     grid: _BeatGrid | None = None
@@ -960,12 +1115,34 @@ def export_to_staff(
     trim_overlap_ql = _overlap_threshold_ql(quantize_divisors) if trim_overlaps else None
     grid_unit = 1.0 / max(quantize_divisors) if quantize_divisors else 0.25
 
+    # (tracks, treble clef, pitch-split side) per staff to build.
+    if split:
+        all_notes = _gather_split_notes(
+            midi_path,
+            staves[0],
+            grid=grid,
+            beat_shift=beat_shift,
+            windows=windows,
+            synth_tracks=synth_tracks,
+        )
+        if grid is not None:
+            bar_ticks = round(grid.felt_per_bar * grid.beat_ql * _EXPORT_TPB)
+        else:
+            bar_ticks = 4 * mido.MidiFile(str(midi_path)).ticks_per_beat
+        curve = _split_curve(all_notes, max(1, bar_ticks))
+        plan = [
+            (staves[0], True, ("treble", curve)),
+            (staves[0], False, ("bass", curve)),
+        ]
+    else:
+        plan = [(tracks, i == 0, None) for i, tracks in enumerate(staves)]
+
     parts = [
         _staff_part(
             midi_path,
             tracks,
             quantize_divisors=quantize_divisors,
-            treble=(i == 0),
+            treble=treble,
             key_label=key,
             meter=meter,
             grid=grid,
@@ -975,8 +1152,9 @@ def export_to_staff(
             mono_min_fragment_ql=grid_unit / 2,
             windows=windows,
             synth_tracks=synth_tracks,
+            pitch_split=pitch_split,
         )
-        for i, tracks in enumerate(staves)
+        for tracks, treble, pitch_split in plan
     ]
 
     if len(parts) >= 2:
@@ -1004,13 +1182,19 @@ def export_to_staff(
         score.insert(0, _metadata(title))
 
     results: dict[str, Path] = {}
-    musicxml_path = out_dir / f"{basename}.musicxml"
+    # Each format gets its own subfolder, keeping the song folder itself tidy
+    # (just the audio, the MIDIs, and the pipeline artifacts).
+    musicxml_dir = out_dir / "musicxml"
+    musicxml_dir.mkdir(parents=True, exist_ok=True)
+    musicxml_path = musicxml_dir / f"{basename}.musicxml"
     score.write("musicxml", fp=str(musicxml_path))
     if "musicxml" in formats:
         results["musicxml"] = musicxml_path
 
     if "abc" in formats:
-        abc_path = _musicxml_to_abc(musicxml_path, out_dir)
+        abc_dir = out_dir / "abc"
+        abc_dir.mkdir(parents=True, exist_ok=True)
+        abc_path = _musicxml_to_abc(musicxml_path, abc_dir)
         if abc_path is not None:
             results["abc"] = abc_path
         else:
@@ -1020,6 +1204,8 @@ def export_to_staff(
 
     if "musicxml" not in formats:
         musicxml_path.unlink(missing_ok=True)  # was only a stepping stone to ABC
+        with contextlib.suppress(OSError):  # drop the folder too if this left it empty
+            musicxml_dir.rmdir()
 
     return results
 

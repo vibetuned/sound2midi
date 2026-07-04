@@ -73,10 +73,13 @@ output/<song>/
   <song>.wav         # downloaded audio
   <song>.mid         # single-model transcription
   <song>.stems.mid   # merged stem transcription (with --stems)
-  <song>.key.json    # detected musical key (skey)
-  <song>.meter.json  # detected tempo + time signature + beat grid (beat-this)
-  <song>.sections.json  # song structure segments (SongFormer, with --sections)
-  <song>.chords.json    # chord progression (lv-chordia, with --chords)
+  artifacts/         # per-song analysis artifacts (JSON)
+    <song>.key.json       # detected musical key (skey)
+    <song>.meter.json     # detected tempo + time signature + beat grid (beat-this)
+    <song>.sections.json  # song structure segments (SongFormer, with --sections)
+    <song>.chords.json    # chord progression (lv-chordia, with --chords)
+  musicxml/          # notation exports (MusicXML), written by the player
+  abc/               # notation exports (ABC), written by the player
   stems/             # stem intermediates (separated WAVs + per-stem MIDIs)
 ```
 
@@ -222,6 +225,9 @@ uv run sound2midi-play song.mid --soundfont /path/to/sf.sf2 --driver pulseaudio
   piano track with its own **Solo/Mute** on the lane — muted by default, so press
   **S** to audition the chords alone, or untick **M** to comp along with the band.
   It follows seek and section loops like any track.
+- Like the instrument lanes, the chord strip supports **Ctrl+click** to toggle the
+  chord voice per section — pick "chords only in the chorus" without ticking its
+  staff box (it lands on staff 1 unless assigned to 2).
 - The lane's **style selector** picks the realization (playback *and* export):
   **block** (bass + root-position chord tones, one hit per chord), **smooth**
   (voice-led — each chord takes the inversion closest to the previous one),
@@ -242,6 +248,14 @@ guessing). Pick a mode, tick instruments, then **Export selected →**:
 - **Grand staff (2)** — tick **1** (top/treble) or **2** (bottom/bass) per instrument to
   place it on that staff; the two are braced into a piano grand staff. Staves are padded
   with full-bar rests so both hands span the same length and stay bar-aligned.
+- **Split (auto)** — tick **1** on one selection; the notes are split into a braced
+  grand staff automatically around a **moving middle**: each bar's notes are divided
+  into two hands by a two-cluster fit over all the bar's note events, so where the
+  notes *mass* is decides the split — a lone genuine bass note still gets the bass
+  staff, but a near-outlier is never stranded on the wrong side. A bar whose notes
+  form one tight cluster stays whole on the nearer staff (melodies keep one hand),
+  and the middle only stays put across bars while the division is unchanged. One
+  voice selection in, piano-style two-hand notation out.
 
 The **Grid** selector sets the notation quantization (default **1/16**, which yields clean
 notes/rests with no tuplets; coarser = simpler, and `… + triplets` options are there when
@@ -292,19 +306,21 @@ through the same beat retiming, quantization, and section windows as any track
 **Section-scoped export**: when sections are selected in the strip (or cells are set),
 the export is cut to them — with Meter on, each section is snapped to whole bars of the
 beat grid, and the windows are concatenated in song order so the score reads as one
-continuous excerpt. Per-section cells decide which instruments sound in each window
-(a section without cells uses all staff-ticked instruments). The output gets a
-`.sections` name suffix. With no strip selection, the sections that have cells form
-the export window.
+continuous excerpt. The export window is the **union** of the strip selection and every
+section that has cells, so a leftover loop selection never hides a cell'd section.
+Per-section cells decide which instruments sound in that window (a section without
+cells uses all staff-ticked instruments). The output gets a `.sections` name suffix.
 
 The score is reduced to just **pitch + rhythm on a single Piano instrument** — the source
 tracks' MIDI programs/channels are stripped, so there are no stray "instrument change"
 entries cluttering (or breaking) the MusicXML.
 
-Output is written next to the source MIDI as `<midi>.<single|grand>.musicxml` and, if your
-`vendor/xml2abc.py` is present, `<midi>.<single|grand>.abc` (MusicXML → ABC via that script;
-set `$SOUND2MIDI_XML2ABC` to point elsewhere). Conversion uses [music21](https://web.mit.edu/music21/)
-(installed with the `player` extra).
+Output is written into per-format subfolders of the song folder —
+`musicxml/<midi>.<single|grand|split>.musicxml` and, if your `vendor/xml2abc.py` is
+present, `abc/<midi>.<single|grand|split>.abc` (MusicXML → ABC via that script; set
+`$SOUND2MIDI_XML2ABC` to point elsewhere) — keeping the song folder itself to the
+audio, the MIDIs, and the pipeline artifacts. Conversion uses
+[music21](https://web.mit.edu/music21/) (installed with the `player` extra).
 
 ## Options
 

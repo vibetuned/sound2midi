@@ -89,8 +89,11 @@ class NoteStrip(QWidget):
             x0 = start / duration * w
             x1 = min(end, duration) / duration * w
             tint = QColor(self.color)
-            tint.setAlpha(48 if audible else 24)
+            tint.setAlpha(70 if audible else 35)
             painter.fillRect(QRectF(x0, 0, x1 - x0, h), tint)
+            painter.setPen(QPen(self.color, 2))  # bright edges make the cell obvious
+            painter.drawLine(int(x0), 1, int(x1), 1)
+            painter.drawLine(int(x0), h - 2, int(x1), h - 2)
 
         # faint 10-second gridlines for time reference
         painter.setPen(QPen(_GRID, 1))

@@ -69,15 +69,22 @@ class ChordStrip(QWidget):
         engine: PlayerEngine,
         on_seek: Callable[[], None] | None = None,
         track_index: int | None = None,
+        sections: list[tuple[float, float]] | None = None,
     ) -> None:
         super().__init__()
         self.chords = chords
         self.engine = engine
         self.track_index = track_index  # synthesized chord track, if one was added
+        self.sections = sections or []  # (start, end) per song section, in order
+        self.cells: set[int] = set()  # section indices the chord voice is picked for
         self._on_seek = on_seek
         self.setMinimumHeight(22)
         self.setMinimumWidth(160)
         self.setMouseTracking(True)  # hover tooltip shows the chord under the cursor
+        if self.sections:
+            self.setToolTip(
+                "Click: seek · Ctrl+click: toggle the chord voice for that section in the export"
+            )
 
     def _chord_at(self, seconds: float) -> ChordSeg | None:
         for seg in self.chords:
@@ -115,6 +122,13 @@ class ChordStrip(QWidget):
                 painter.setPen(QColor(20, 20, 22) if audible else QColor(120, 120, 126))
                 painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, seg.display)
 
+        # highlight the sections the chord voice is picked for (export cells)
+        for i in self.cells:
+            start, end = self.sections[i]
+            x0 = start / duration * w
+            x1 = min(end, duration) / duration * w
+            painter.fillRect(QRectF(x0, 0, x1 - x0, h), QColor(255, 255, 255, 45))
+
         x = int(self.engine.position() / duration * w)
         painter.setPen(QPen(_PLAYHEAD, 1))
         painter.drawLine(x, 0, x, h)
@@ -129,11 +143,20 @@ class ChordStrip(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         duration = self.engine.duration
-        if duration > 0:
-            self.engine.seek(event.position().x() / max(1, self.width()) * duration)
-            if self._on_seek is not None:
-                self._on_seek()
-            self.update()
+        if duration <= 0:
+            return
+        seconds = event.position().x() / max(1, self.width()) * duration
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and self.sections:
+            for i, (start, end) in enumerate(self.sections):
+                if start <= seconds < end:
+                    self.cells.symmetric_difference_update({i})
+                    self.update()
+                    break
+            return
+        self.engine.seek(seconds)
+        if self._on_seek is not None:
+            self._on_seek()
+        self.update()
 
 
 class ChordLane(QFrame):
@@ -149,6 +172,7 @@ class ChordLane(QFrame):
         engine: PlayerEngine,
         *,
         track_index: int | None = None,
+        sections: list[tuple[float, float]] | None = None,
         on_seek: Callable[[], None] | None = None,
         on_toggle: Callable[[], None] | None = None,
         on_style: Callable[[str], None] | None = None,
@@ -211,7 +235,9 @@ class ChordLane(QFrame):
         crow.addWidget(self.solo_btn)
         crow.addWidget(self.mute_btn)
 
-        self.strip = ChordStrip(chords, engine, on_seek=on_seek, track_index=track_index)
+        self.strip = ChordStrip(
+            chords, engine, on_seek=on_seek, track_index=track_index, sections=sections
+        )
 
         layout.addWidget(control)
         layout.addWidget(self.strip, 1)
@@ -259,3 +285,7 @@ class ChordLane(QFrame):
     def chord_style(self) -> str:
         """The selected realization style ('block', 'smooth', 'arpeggio', 'bass')."""
         return str(self.style_combo.currentData())
+
+    def cells(self) -> set[int]:
+        """Section indices the chord voice is picked for (Ctrl+click on the strip)."""
+        return set(self.strip.cells)

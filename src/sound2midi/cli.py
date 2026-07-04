@@ -248,7 +248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Done. MIDI written to {output_midi}")
 
     if args.detect_key:
-        key_json = song_dir / f"{song_name}.key.json"
+        key_json = song_dir / "artifacts" / f"{song_name}.key.json"
         if args.force or not key_json.exists():
             if not args.quiet:
                 print("Detecting key (skey) ...")
@@ -263,7 +263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Key already detected: {key_json}")
 
     if args.detect_meter:
-        meter_json = song_dir / f"{song_name}.meter.json"
+        meter_json = song_dir / "artifacts" / f"{song_name}.meter.json"
         if args.force or not meter_json.exists():
             if not args.quiet:
                 print("Detecting tempo + time signature (beat-this) ...")
@@ -285,7 +285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Meter already detected: {meter_json}")
 
     if args.chords:
-        chords_json = song_dir / f"{song_name}.chords.json"
+        chords_json = song_dir / "artifacts" / f"{song_name}.chords.json"
         if args.force or not chords_json.exists():
             if not args.quiet:
                 print("Detecting chords (lv-chordia) ...")
@@ -301,7 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Chords already detected: {chords_json}")
 
     if args.sections:
-        sections_json = song_dir / f"{song_name}.sections.json"
+        sections_json = song_dir / "artifacts" / f"{song_name}.sections.json"
         if args.force or not sections_json.exists():
             if not args.quiet:
                 print("Detecting song structure (SongFormer) ...")
