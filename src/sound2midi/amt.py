@@ -334,6 +334,68 @@ def detect_meter(
     )
 
 
+# lv-chordia (openmirlab's package of the ISMIR 2019 Large-Vocabulary Chord
+# Transcription model) — plain pip package, rides the AMT venv's torch.
+CHORD_DEPS = ("lv-chordia",)
+
+
+def _chords_detect_script() -> Path:
+    return Path(__file__).resolve().parent / "_amt" / "chords_detect.py"
+
+
+def ensure_chord_deps(home: Path, *, reinstall: bool = False) -> Path:
+    """Ensure the AMT env plus lv-chordia (chord recognition) are installed."""
+    python = ensure_env(home, reinstall=reinstall)
+    marker = home / ".venv" / ".sound2midi-chord-deps-installed"
+    if marker.exists() and not reinstall:
+        return python
+    _run([_uv(), "pip", "install", "--python", str(python), *CHORD_DEPS])
+    marker.write_text("ok\n")
+    return python
+
+
+def detect_chords(
+    audio_path: Path,
+    *,
+    home: Path,
+    output_json: Path | None = None,
+    chord_dict: str = "submission",
+) -> dict:
+    """Detect the song's chord progression with lv-chordia; optionally save JSON.
+
+    Returns the summary dict, e.g. ``{"n_chords": 71, "distinct": 9, ...}``. The
+    JSON artifact contains the full labeled chord segments.
+    """
+    python = ensure_chord_deps(home)
+    cmd: list[str] = [
+        str(python),
+        str(_chords_detect_script()),
+        "--audio",
+        str(audio_path.resolve()),
+        "--chord-dict",
+        chord_dict,
+    ]
+    if output_json is not None:
+        cmd += ["--output-json", str(output_json.resolve())]
+
+    print(f"$ {' '.join(cmd)}", file=sys.stderr, flush=True)
+    result = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, check=True)
+
+    for line in reversed(result.stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                summary = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "n_chords" in summary:
+                return summary
+    raise RuntimeError(
+        f"chord detection produced no result.\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr[-800:]}"
+    )
+
+
 def detect_key(
     audio_path: Path,
     *,

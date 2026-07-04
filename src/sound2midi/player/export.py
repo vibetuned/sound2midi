@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Any
 
 import mido
-from music21 import chord, clef, converter, instrument, layout, note, pitch, stream
+from music21 import chord, clef, converter, harmony, instrument, layout, note, pitch, stream
 from music21 import key as m21key
+
+from sound2midi.player import chordlabel
 
 _CONDUCTOR_META = frozenset({"set_tempo", "time_signature", "key_signature"})
 
@@ -90,6 +92,113 @@ def _key_signature(label: str) -> Any | None:
     except Exception:
         return None
     return ksig
+
+
+def _spelled_pc(pc: int, ksig: Any | None) -> str:
+    """Spell a pitch class to the key (diatonic name, else the key's accidental
+    direction), music21-style ('-' flats). Sharps when there is no key."""
+    if ksig is not None:
+        for scale_pitch in ksig.pitches:
+            if int(scale_pitch.pitchClass) == pc:
+                return str(scale_pitch.name)
+        return (_FLAT_NAMES if ksig.sharps < 0 else _SHARP_NAMES)[pc]
+    return _SHARP_NAMES[pc]
+
+
+def _chord_symbol(label: str, ksig: Any | None) -> tuple[str, Any] | None:
+    """A (figure-key, music21 ChordSymbol) for a Harte label; None for N/X."""
+    parsed = chordlabel.parse(label)
+    if parsed is None:
+        return None
+    root_name = _spelled_pc(chordlabel.ROOT_PC[parsed.root], ksig)
+    kind = chordlabel.KIND_M21[chordlabel.base_kind(parsed.kind)]
+    bass_name = None
+    bpc = chordlabel.bass_pc(parsed)
+    if bpc is not None and bpc != chordlabel.ROOT_PC[parsed.root]:
+        bass_name = _spelled_pc(bpc, ksig)
+    try:
+        symbol = harmony.ChordSymbol(root=root_name, bass=bass_name, kind=kind)
+    except Exception:
+        return None
+    symbol.writeAsChord = False  # annotation above the staff, not sounding notes
+    return (f"{root_name}:{kind}/{bass_name}", symbol)
+
+
+def _chord_symbol_events(
+    chords: Sequence[dict],
+    *,
+    midi_path: Path,
+    grid: _BeatGrid | None,
+    beat_shift: float,
+    windows: list[_Window] | None,
+    key_label: str | None,
+) -> list[tuple[float, Any]]:
+    """Map chord segments to (quarterLength offset, ChordSymbol) score events.
+
+    Offsets go through the same time mapping as the notes: snapped to the
+    nearest felt beat on the beat grid (when there is one), then through the
+    section windows. Same-offset collisions keep the later chord; consecutive
+    repeats are merged.
+    """
+    ksig = _key_signature(key_label) if key_label else None
+    sec_to_tick = None
+    tpb = _EXPORT_TPB
+    if grid is None:
+        src = mido.MidiFile(str(midi_path))
+        sec_to_tick = _sec_to_tick_fn(src)
+        tpb = src.ticks_per_beat
+
+    def map_tick(tick: int) -> int | None:
+        if windows is None:
+            return max(0, tick)
+        for in0, in1, out0, _ in windows:
+            if in0 <= tick < in1:
+                return tick - in0 + out0
+        return None
+
+    by_offset: dict[float, tuple[str, Any]] = {}
+    for seg in sorted(chords, key=lambda c: float(c["start"])):
+        made = _chord_symbol(str(seg["label"]), ksig)
+        if made is None:
+            continue
+        start = float(seg["start"])
+        if grid is not None:
+            beat = round(grid.pos(start))  # nearest felt beat
+            tick = round((beat + beat_shift) * grid.beat_ql * _EXPORT_TPB)
+        else:
+            assert sec_to_tick is not None
+            tick = sec_to_tick(start)
+        mapped = map_tick(tick)
+        if mapped is None:
+            continue
+        by_offset[mapped / tpb] = made  # later chord wins a same-beat collision
+
+    events: list[tuple[float, Any]] = []
+    previous = None
+    for offset in sorted(by_offset):
+        figure_key, symbol = by_offset[offset]
+        if figure_key == previous:
+            continue
+        previous = figure_key
+        events.append((offset, symbol))
+    return events
+
+
+def _insert_chord_symbols(part: Any, events: list[tuple[float, Any]]) -> None:
+    """Insert ChordSymbols into the measures containing their offsets."""
+    measures = list(part.getElementsByClass(stream.Measure))
+    if not measures:
+        for offset, symbol in events:
+            part.insert(offset, symbol)
+        return
+    offsets = [m.offset for m in measures]
+    span_end = measures[-1].offset + measures[-1].barDuration.quarterLength
+    for offset, symbol in events:
+        if offset >= span_end:
+            continue
+        i = max(0, bisect.bisect_right(offsets, offset + 1e-6) - 1)
+        measure = measures[i]
+        measure.insert(max(0.0, offset - measure.offset), symbol)
 
 
 def find_xml2abc() -> Path | None:
@@ -214,6 +323,22 @@ def _clean_overlaps(notes: list[list], *, sync_ticks: int, max_overlap_ticks: in
         if kept is None or record[3] > kept[3]:
             unique[key] = record
     return [n for n in unique.values() if n[1] > n[0]]
+
+
+# A synthesized (non-MIDI-file) track: (start_sec, end_sec, midi_notes) chord
+# events, realized from a chords artifact. Injected into the staff builders under
+# a track index beyond the file's own tracks.
+SynthTrack = list[tuple[float, float, tuple[int, ...]]]
+
+
+def _synth_notes(events: SynthTrack, sec_to_out_tick: Any) -> list[list]:
+    """Flatten synth chord events into note records in the builder's tick space."""
+    notes: list[list] = []
+    for start, end, pitches in events:
+        t0 = sec_to_out_tick(start)
+        t1 = max(t0 + 1, sec_to_out_tick(end))
+        notes.extend([t0, t1, note_num, 70, 0] for note_num in pitches)
+    return notes
 
 
 # A section window in some tick space: (in_start, in_end, out_start, allowed_tracks).
@@ -354,11 +479,13 @@ def _build_reduced_midi(
     mono_min_fragment_ql: float = 0.125,
     quantize_divisors: Sequence[int] | None = None,
     windows: list[_Window] | None = None,
+    synth_tracks: dict[int, SynthTrack] | None = None,
 ) -> None:
     """Write a MIDI containing only the given tracks plus a tempo/meta conductor.
 
     ``windows`` (original tick space) restricts the output to those spans,
     concatenated; conductor state at the first window's start is carried to 0.
+    ``synth_tracks`` maps out-of-file track indices to realized chord events.
     """
     orig = mido.MidiFile(str(src))
     reduced = mido.MidiFile(type=1, ticks_per_beat=orig.ticks_per_beat)
@@ -397,10 +524,16 @@ def _build_reduced_midi(
     reduced.tracks.append(conductor)
 
     tpb = orig.ticks_per_beat
+    sec_to_tick = None
     for index in track_indices:
-        if not (0 <= index < len(orig.tracks)):
+        if synth_tracks is not None and index in synth_tracks:
+            if sec_to_tick is None:
+                sec_to_tick = _sec_to_tick_fn(orig)
+            notes = _synth_notes(synth_tracks[index], sec_to_tick)
+        elif 0 <= index < len(orig.tracks):
+            notes = _extract_notes(orig.tracks[index])
+        else:
             continue
-        notes = _extract_notes(orig.tracks[index])
         if windows is not None:
             notes = _slice_notes_to_windows(notes, windows, index)
         if trim_overlap_ql:
@@ -544,6 +677,7 @@ def _build_beat_aligned_midi(
     mono_min_fragment_ql: float = 0.125,
     quantize_divisors: Sequence[int] | None = None,
     windows: list[_Window] | None = None,
+    synth_tracks: dict[int, SynthTrack] | None = None,
 ) -> None:
     """Write a reduced MIDI retimed to the beat grid, with real tempo + time signature.
 
@@ -574,18 +708,24 @@ def _build_beat_aligned_midi(
     conductor.append(mido.MetaMessage("end_of_track", time=0))
     out.tracks.append(conductor)
 
-    def new_tick(abs_tick: int) -> int:
-        beat_pos = grid.pos(tick_to_sec(abs_tick)) + beat_shift
+    def new_tick_sec(seconds: float) -> int:
+        beat_pos = grid.pos(seconds) + beat_shift
         tick = round(beat_pos * grid.beat_ql * _EXPORT_TPB)
         return tick if windows is not None else max(0, tick)
 
+    def new_tick(abs_tick: int) -> int:
+        return new_tick_sec(tick_to_sec(abs_tick))
+
     for index in track_indices:
-        if not (0 <= index < len(src.tracks)):
+        if synth_tracks is not None and index in synth_tracks:
+            notes = _synth_notes(synth_tracks[index], new_tick_sec)
+        elif 0 <= index < len(src.tracks):
+            notes = _extract_notes(src.tracks[index])
+            for record in notes:
+                record[0] = new_tick(record[0])
+                record[1] = max(record[0] + 1, new_tick(record[1]))
+        else:
             continue
-        notes = _extract_notes(src.tracks[index])
-        for record in notes:
-            record[0] = new_tick(record[0])
-            record[1] = max(record[0] + 1, new_tick(record[1]))
         if windows is not None:
             notes = _slice_notes_to_windows(notes, windows, index)
         if trim_overlap_ql:
@@ -619,6 +759,7 @@ def _staff_part(
     mono_tracks: frozenset[int] = frozenset(),
     mono_min_fragment_ql: float = 0.125,
     windows: list[_Window] | None = None,
+    synth_tracks: dict[int, SynthTrack] | None = None,
 ) -> Any:
     """Build one chordified staff (a music21 Part) from the given tracks."""
     # music21's MIDI parser quantizes on import, so the grid must be set at parse time
@@ -639,6 +780,7 @@ def _staff_part(
                 mono_min_fragment_ql=mono_min_fragment_ql,
                 quantize_divisors=quantize_divisors,
                 windows=windows,
+                synth_tracks=synth_tracks,
             )
         else:
             _build_reduced_midi(
@@ -650,6 +792,7 @@ def _staff_part(
                 mono_min_fragment_ql=mono_min_fragment_ql,
                 quantize_divisors=quantize_divisors,
                 windows=windows,
+                synth_tracks=synth_tracks,
             )
         if quantize_divisors:
             # already snapped to the grid in tick space (see _snap_to_grid); music21's
@@ -720,6 +863,8 @@ def export_to_staff(
     mono_tracks: frozenset[int] | set[int] = frozenset(),
     title: str | None = None,
     sections: Sequence[dict] | None = None,
+    chords: Sequence[dict] | None = None,
+    synth_tracks: dict[int, SynthTrack] | None = None,
 ) -> dict[str, Path]:
     """Export the chosen tracks of ``midi_path`` to notation files in ``out_dir``.
 
@@ -739,6 +884,14 @@ def export_to_staff(
     window is snapped to whole bars of the beat grid (when ``meter`` is applied)
     and the windows are concatenated; a window's ``tracks`` restricts which of the
     staff's tracks sound in it (``None`` = all of them).
+
+    ``chords`` writes chord symbols above the top staff: a list of
+    ``{"label": "C:maj", "start": seconds, "end": seconds}`` segments (from
+    ``<song>.chords.json``), snapped to the beat grid and respelled to ``key``.
+
+    ``synth_tracks`` injects synthesized tracks (realized chord voicings, times
+    in seconds) under out-of-file track indices, so they can be assigned to
+    staves like any instrument.
 
     Returns a mapping of produced format -> path (and "abc_error" if ABC could not
     be produced).
@@ -821,12 +974,24 @@ def export_to_staff(
             mono_tracks=frozenset(mono_tracks),
             mono_min_fragment_ql=grid_unit / 2,
             windows=windows,
+            synth_tracks=synth_tracks,
         )
         for i, tracks in enumerate(staves)
     ]
 
     if len(parts) >= 2:
         _pad_to_equal_length(parts)
+
+    if chords:
+        events = _chord_symbol_events(
+            chords,
+            midi_path=midi_path,
+            grid=grid,
+            beat_shift=beat_shift,
+            windows=windows,
+            key_label=key,
+        )
+        _insert_chord_symbols(parts[0], events)
 
     score = stream.Score()
     for part in parts:

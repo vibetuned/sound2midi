@@ -11,6 +11,7 @@ from sound2midi import __version__
 from sound2midi.amt import (
     MODEL_TYPES,
     default_amt_home,
+    detect_chords,
     detect_key,
     detect_meter,
     setup,
@@ -136,6 +137,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Skip tempo/time-signature detection (runs by default via beat-this, "
         "saved as <song>.meter.json).",
+    )
+    parser.add_argument(
+        "--chords",
+        action="store_true",
+        help="Detect the chord progression (lv-chordia, large vocabulary), saved as "
+        "<song>.chords.json. Opt-in; installs into the AMT venv on first use.",
     )
     parser.add_argument(
         "--sections",
@@ -276,6 +283,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Meter detection failed: {exc}", file=sys.stderr)
         elif not args.quiet:
             print(f"Meter already detected: {meter_json}")
+
+    if args.chords:
+        chords_json = song_dir / f"{song_name}.chords.json"
+        if args.force or not chords_json.exists():
+            if not args.quiet:
+                print("Detecting chords (lv-chordia) ...")
+            try:
+                chords = detect_chords(audio_path, home=amt_home, output_json=chords_json)
+                print(
+                    f"Detected {chords['n_chords']} chords "
+                    f"({chords['distinct']} distinct)  (saved to {chords_json})"
+                )
+            except Exception as exc:  # non-fatal: don't lose the transcription
+                print(f"Chord detection failed: {exc}", file=sys.stderr)
+        elif not args.quiet:
+            print(f"Chords already detected: {chords_json}")
 
     if args.sections:
         sections_json = song_dir / f"{song_name}.sections.json"

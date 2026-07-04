@@ -22,6 +22,8 @@ flowchart LR
     WAV -->|"S-KEY"| KEY["key.json"]
     WAV -->|"Beat This!"| METER["meter.json<br/>tempo + time signature + beat grid"]
     WAV -->|"--sections: SongFormer"| SECTIONS["sections.json<br/>intro/verse/chorus segments"]
+    WAV -->|"--chords: lv-chordia"| CHORDS["chords.json<br/>chord progression"]
+    CHORDS --> PLAYER
 
     MID --> PLAYER
     MERGED --> PLAYER
@@ -74,6 +76,7 @@ output/<song>/
   <song>.key.json    # detected musical key (skey)
   <song>.meter.json  # detected tempo + time signature + beat grid (beat-this)
   <song>.sections.json  # song structure segments (SongFormer, with --sections)
+  <song>.chords.json    # chord progression (lv-chordia, with --chords)
   stems/             # stem intermediates (separated WAVs + per-stem MIDIs)
 ```
 
@@ -143,6 +146,23 @@ MIDI's between-beat onsets to duple vs triple grids (a triple majority turns 2/4
 beat alignment. Pass `--no-meter` to skip. Like skey, it installs into the AMT venv on
 first use (plain PyTorch, no madmom).
 
+### Chord detection (`--chords`)
+
+Opt-in: [lv-chordia](https://pypi.org/project/lv-chordia/) (openmirlab's package of the
+ISMIR 2019 *Large-Vocabulary Chord Transcription* model) labels the full mix with
+Harte-style chords — `C:maj`, `A:min7`, `E:maj/3` (inversions as chord degrees), `N`
+for no-chord — saved to `<song>.chords.json`. Like skey and beat-this it installs into
+the AMT venv on first use (plain pip package, rides its torch); a song takes a few
+seconds. The player shows the progression as a chord strip, and the exporter can write
+the symbols into the score (see below).
+
+```bash
+uv run sound2midi VIDEO_ID --chords
+```
+
+Chord recognition runs on the full mix by design — the model is trained on mixes, and
+source-separation artifacts tend to hurt more than mix "noise" helps.
+
 ### Song structure detection (`--sections`)
 
 Opt-in (it is the heaviest artifact): [SongFormer](https://github.com/ASLP-lab/SongFormer)
@@ -195,6 +215,20 @@ uv run sound2midi-play song.mid --soundfont /path/to/sf.sf2 --driver pulseaudio
   (instrument, section) **cell** — "this instrument plays in this part" — shown as a
   tint in the track's color. Cells pick instruments per section for the export; a
   cell'd instrument doesn't need its staff box ticked (it defaults to staff 1).
+- If a `<song>.chords.json` is present (from `--chords`), a **chord strip** shows the
+  progression under the section strip: blocks colored by root pitch class (minor
+  chords darker), labels where they fit (`F#m`, `B7`, `E/G#`), hover for the rest.
+  Click to seek. The progression is also **playable**: it's realized as a synthesized
+  piano track with its own **Solo/Mute** on the lane — muted by default, so press
+  **S** to audition the chords alone, or untick **M** to comp along with the band.
+  It follows seek and section loops like any track.
+- The lane's **style selector** picks the realization (playback *and* export):
+  **block** (bass + root-position chord tones, one hit per chord), **smooth**
+  (voice-led — each chord takes the inversion closest to the previous one),
+  **arpeggio** (bass then chord tones cycled upward, one note per beat), or
+  **bass** (the bass line alone). The lane also has **staff checkboxes**, making
+  the realized chords a regular *voice* you can put on staff 1 or 2 of the export
+  like any instrument.
 - Soundfont search order: `--soundfont`, then `$SOUND2MIDI_SOUNDFONT`, then common system
   paths. Audio driver auto-selects; override with `--driver` or `$SOUND2MIDI_FLUID_DRIVER`.
 
@@ -242,6 +276,19 @@ downbeat** (pickup notes get whole leading bars, identical across both staves). 
 this, the MIDI's flat default tempo (120) makes barlines and rhythm values arbitrary;
 with it, a "1/16" on the grid selector is an actual sixteenth of the music.
 
+If a `<song>.chords.json` is present, a **Chords:** toggle writes the detected chord
+symbols above the top staff: snapped to the nearest beat of the beat grid, respelled
+to the key (sharps/flats follow the key signature), repeats merged, no-chord spans
+skipped. They come out as real `<harmony>` elements in MusicXML (Verovio renders
+them) and as `"F#m"`-style annotations in ABC. With a section-cut export the symbols
+are mapped into the cut windows.
+
+Independently, the **realized chord voice** (the chord lane's staff checkboxes) can
+be exported as actual notes on either staff, in the lane's selected style — e.g.
+melody on staff 1, smooth-voiced chords on staff 2 of a grand staff. It passes
+through the same beat retiming, quantization, and section windows as any track
+(and is always kept in cell-restricted sections, since it has no cells of its own).
+
 **Section-scoped export**: when sections are selected in the strip (or cells are set),
 the export is cut to them — with Meter on, each section is snapped to whole bars of the
 beat grid, and the windows are concatenated in song order so the score reads as one
@@ -274,6 +321,7 @@ set `$SOUND2MIDI_XML2ABC` to point elsewhere). Conversion uses [music21](https:/
 | `--no-key` | Skip key detection (on by default; saved to `<song>.key.json`) |
 | `--no-meter` | Skip tempo/time-signature detection (on by default; saved to `<song>.meter.json`) |
 | `--sections` | Detect song structure with SongFormer (opt-in; saved to `<song>.sections.json`) |
+| `--chords` | Detect the chord progression with lv-chordia (opt-in; saved to `<song>.chords.json`) |
 | `--amt-home` | Where to keep the AMT checkout + venv |
 | `--reinstall` | Rebuild the AMT venv from scratch |
 | `--infer-arg` | Forward a raw flag to `infer.py` (repeatable) |
@@ -300,13 +348,16 @@ Layout:
 - `src/sound2midi/_amt/key_detect.py` — runs **inside the AMT venv**; skey key detection.
 - `src/sound2midi/_amt/meter_detect.py` — runs **inside the AMT venv**; Beat This! beat
   tracking + meter/tempo inference.
+- `src/sound2midi/_amt/chords_detect.py` — runs **inside the AMT venv**; lv-chordia
+  chord recognition.
 - `src/sound2midi/sections.py` — manage the SongFormer checkout/venv (same pattern as
   `amt.py`); song-structure detection entry point.
 - `src/sound2midi/_songformer/sections_detect.py` — runs **inside the SongFormer venv**;
   headless port of SongFormer's single-file inference (excluded from lint/type-check).
 - `src/sound2midi/player/` — FluidSynth playback `engine`, `pianoroll` lanes,
-  `sectionstrip` (clickable song-structure strip + loop), `export` (beat-aligned
-  music21 → MusicXML/ABC), PySide6 window.
+  `sectionstrip` (clickable song-structure strip + loop), `chordstrip` + `chordlabel`
+  (chord progression strip; Harte-label parsing shared with export), `export`
+  (beat-aligned music21 → MusicXML/ABC with chord symbols), PySide6 window.
 
 ## Roadmap
 
@@ -321,7 +372,7 @@ Planned artifacts, mainly to feed [midi-stroke](https://github.com/vibetuned/mid
   solo/mute, so this is a thin feature on top of the stems).
 - **Section-scoped backing tracks** — apply the section cut to the backing-track
   render as well (the notation export already supports it).
-- More per-song artifacts (chords, …) as midi-stroke needs them.
+- More per-song artifacts as midi-stroke needs them.
 
 ## References
 
@@ -334,6 +385,7 @@ Models and papers this pipeline builds on:
 | Key detection | [deezer/skey](https://github.com/deezer/skey) | Kong et al., *S-KEY: Self-Supervised Learning of Major and Minor Keys from Audio*, ICASSP 2025; predecessor [deezer/stone](https://github.com/deezer/stone), *STONE: Self-Supervised Tonality Estimator*, ISMIR 2024 |
 | Beat/downbeat tracking | [CPJKU/beat_this](https://github.com/CPJKU/beat_this) | Foscarin, Schlüter, Widmer, *Beat This! Accurate Beat Tracking Without DBN Postprocessing*, ISMIR 2024 |
 | Song structure (sections) | [ASLP-lab/SongFormer](https://github.com/ASLP-lab/SongFormer) | Hao et al., *SongFormer: Scaling Music Structure Analysis with Heterogeneous Supervision*, arXiv 2025 |
+| Chord recognition | [lv-chordia](https://pypi.org/project/lv-chordia/) ([music-x-lab](https://github.com/music-x-lab/ISMIR2019-Large-Vocabulary-Chord-Recognition)) | Jiang, Chen, Li, Xia, *Large-Vocabulary Chord Transcription via Chord Structure Decomposition*, ISMIR 2019 |
 
 Tooling: [yt-dlp](https://github.com/yt-dlp/yt-dlp), [music21](https://github.com/cuthbertLab/music21)
 (MIT, Cuthbert et al.), [mido](https://github.com/mido/mido),

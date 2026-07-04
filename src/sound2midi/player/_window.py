@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sound2midi.player import chordlabel
+from sound2midi.player.chordstrip import ChordLane, build_chords
 from sound2midi.player.engine import PlayerEngine, polyphony_ratio
 from sound2midi.player.export import export_to_staff
 from sound2midi.player.pianoroll import InstrumentLane
@@ -56,6 +58,8 @@ class PlayerWindow(QMainWindow):
         self._section_lane: SectionLane | None = None
         self._selected_sections: list[int] = []  # strip selection (section indices)
         self._loops: list[tuple[float, float]] = []  # playback windows, in song order
+        self._chords: list[dict] = []  # raw chord segments for export
+        self._chord_lane: ChordLane | None = None
         self._detected_key: str | None = None
         self._detected_meter: dict | None = None
         self._build_ui()
@@ -161,6 +165,13 @@ class PlayerWindow(QMainWindow):
             "tempo + time signature, bars anchored on downbeats"
         )
         export2.addWidget(self.apply_meter_box)
+        self.apply_chords_box = QCheckBox("Chords")
+        self.apply_chords_box.setEnabled(False)
+        self.apply_chords_box.setToolTip(
+            "Write the detected chord symbols (from <song>.chords.json) above the top "
+            "staff, snapped to the beat grid and respelled to the key"
+        )
+        export2.addWidget(self.apply_chords_box)
         self.fmt_musicxml = QCheckBox("MusicXML")
         self.fmt_musicxml.setChecked(True)
         self.fmt_abc = QCheckBox("ABC")
@@ -246,7 +257,40 @@ class PlayerWindow(QMainWindow):
             )
             self.lane_layout.insertWidget(0, self._section_lane)
 
+        # Key and meter artifacts load before the chord strip: the arpeggio
+        # realization wants the beat grid.
         self._detected_key = self._load_key(path)
+        self._detected_meter = self._load_meter(path)
+
+        # Chord strip (from <song>.chords.json, written by --chords).
+        if self._chord_lane is not None:
+            self._chord_lane.setParent(None)
+            self._chord_lane.deleteLater()
+            self._chord_lane = None
+        chords_data = self._load_artifact(path, "chords")
+        segments = chords_data.get("chords") if chords_data else None
+        self._chords = segments if isinstance(segments, list) else []
+        if self._chords:
+            # Realize the progression as a synthesized piano track so it can be
+            # auditioned (muted by default, Solo/Mute on the lane) and exported
+            # as a staff. Chord times are seconds, the engine's own clock.
+            chord_notes = self._realize_chord_notes("block")
+            chord_track = None
+            if chord_notes:
+                chord_track = self.engine.add_chord_track(chord_notes).index
+                self.engine.set_muted(chord_track, True)  # opt-in listening
+            self._chord_lane = ChordLane(
+                build_chords(self._chords),
+                self.engine,
+                track_index=chord_track,
+                on_seek=self._after_seek,
+                on_toggle=self._refresh_lanes,
+                on_style=self._on_chord_style,
+            )
+            self.lane_layout.insertWidget(1 if self._section_lane else 0, self._chord_lane)
+        self.apply_chords_box.setEnabled(bool(self._chords))
+        self.apply_chords_box.setChecked(bool(self._chords))
+        self._sync_export_controls()  # grand-mode staff boxes on the new lanes
         if self._detected_key:
             self.apply_key_box.setText(f"Key: {self._detected_key}")
             self.apply_key_box.setEnabled(True)
@@ -256,7 +300,6 @@ class PlayerWindow(QMainWindow):
             self.apply_key_box.setChecked(False)
             self.apply_key_box.setEnabled(False)
 
-        self._detected_meter = self._load_meter(path)
         if self._detected_meter:
             ts = self._detected_meter.get("time_signature", "?")
             bpm = self._detected_meter.get("bpm")
@@ -359,6 +402,29 @@ class PlayerWindow(QMainWindow):
         if self.engine.playing:
             self.play_btn.setText("Pause")
 
+    def _realize_chord_notes(self, style: str) -> list[tuple[float, float, tuple[int, ...]]]:
+        """Realize the chords artifact as notes in the given style, clamped to the
+        song and using the detected beat grid (for arpeggios) when present."""
+        duration = self.engine.duration
+        segs = []
+        for seg in build_chords(self._chords):
+            end = min(seg.end, duration)
+            if end - seg.start >= 0.05:
+                segs.append((seg.label, seg.start, end))
+        beats = None
+        if self._detected_meter:
+            beats = [float(b) for b in self._detected_meter.get("beats") or []] or None
+        return chordlabel.realize_chords(segs, style, beats=beats)
+
+    def _on_chord_style(self, style: str) -> None:
+        """Rebuild the synthesized chord track when the lane's style changes."""
+        if self._chord_lane is None or self._chord_lane.track_index is None:
+            return
+        self.engine.update_chord_track(
+            self._chord_lane.track_index, self._realize_chord_notes(style)
+        )
+        self._refresh_playheads()
+
     def _on_sections_selected(self, indices: list[int]) -> None:
         self._selected_sections = list(indices)
         duration = self.engine.duration
@@ -382,6 +448,8 @@ class PlayerWindow(QMainWindow):
     def _refresh_lanes(self) -> None:
         for lane in self._lanes:
             lane.sync()
+        if self._chord_lane is not None:
+            self._chord_lane.sync()
 
     # -- export ----------------------------------------------------------
     def _sync_export_controls(self) -> None:
@@ -391,6 +459,8 @@ class PlayerWindow(QMainWindow):
         )
         for lane in self._lanes:
             lane.set_grand_mode(grand)
+        if self._chord_lane is not None:
+            self._chord_lane.set_grand_mode(grand)
 
     def _export(self) -> None:
         midi = self.engine.song.path
@@ -418,12 +488,31 @@ class PlayerWindow(QMainWindow):
                     if lane.on_staff1() or cell_map[lane.track.index]
                 ]
             ]
+        # The realized chord track exports as a regular voice: its lane has the
+        # same staff checkboxes, and its notes are synthesized (not in the file).
+        synth_tracks_arg = None
+        chord_lane = self._chord_lane
+        chord_track = chord_lane.track_index if chord_lane is not None else None
+        if (
+            chord_lane is not None
+            and chord_track is not None
+            and (chord_lane.on_staff1() or chord_lane.on_staff2())
+        ):
+            synth_tracks_arg = {chord_track: self._realize_chord_notes(chord_lane.chord_style())}
+            if grand:
+                if chord_lane.on_staff1():
+                    staves[0].append(chord_track)
+                if chord_lane.on_staff2():
+                    staves[1].append(chord_track)
+            else:
+                staves[0].append(chord_track)
+
         if not any(staves):
             QMessageBox.information(
                 self,
                 "Export",
-                "Tick a staff checkbox on one or more instruments first "
-                "(or Ctrl+click sections on their lanes).",
+                "Tick a staff checkbox on one or more instruments (or the Chords lane) "
+                "first — or Ctrl+click sections on their lanes.",
             )
             return
 
@@ -440,6 +529,12 @@ class PlayerWindow(QMainWindow):
             }
             for i in section_indices
         ] or None
+        if sections_arg and synth_tracks_arg and chord_track is not None:
+            # The chord voice has no cells; keep it in every cell-restricted window.
+            for window in sections_arg:
+                tracks = window["tracks"]
+                if isinstance(tracks, set):
+                    window["tracks"] = tracks | {chord_track}
 
         formats = []
         if self.fmt_musicxml.isChecked():
@@ -462,6 +557,7 @@ class PlayerWindow(QMainWindow):
         meter = self._detected_meter if apply_meter else None
         trim_overlaps = self.trim_box.isChecked()
         mono_tracks = frozenset(lane.track.index for lane in self._lanes if lane.is_mono())
+        chords_arg = list(self._chords) if self.apply_chords_box.isChecked() else None
 
         self.export_btn.setEnabled(False)
         self.export_btn.setText("Exporting…")
@@ -481,6 +577,8 @@ class PlayerWindow(QMainWindow):
                     mono_tracks=mono_tracks,
                     title=midi_path.stem,
                     sections=sections_arg,
+                    chords=chords_arg,
+                    synth_tracks=synth_tracks_arg,
                 )
                 self.export_done.emit(result)
             except Exception as exc:  # delivered to the GUI thread via the signal
@@ -506,6 +604,8 @@ class PlayerWindow(QMainWindow):
             lane.refresh_playhead()
         if self._section_lane is not None:
             self._section_lane.refresh_playhead()
+        if self._chord_lane is not None:
+            self._chord_lane.refresh_playhead()
 
     # -- periodic update -------------------------------------------------
     def _tick(self) -> None:

@@ -164,6 +164,22 @@ _CHANNEL_MESSAGE_TYPES = frozenset(
     {"note_on", "note_off", "control_change", "program_change", "pitchwheel"}
 )
 
+# Synthesized (non-MIDI-file) tracks — e.g. the realized chord accompaniment —
+# play on a channel beyond the file's 16. pyfluidsynth allocates 256 MIDI
+# channels by default, so channel 16 is always free.
+CHORD_CHANNEL = 16
+
+
+@dataclass
+class _SynthMessage:
+    """A minimal stand-in for a mido channel message, for synthesized tracks
+    (mido validates channel <= 15, so it can't carry the chord channel)."""
+
+    type: str  # "note_on" | "note_off"
+    channel: int
+    note: int
+    velocity: int
+
 
 def find_soundfont(override: str | None = None) -> Path:
     """Locate a soundfont (.sf2/.sf3). Honors arg, then $SOUND2MIDI_SOUNDFONT, then defaults."""
@@ -384,6 +400,7 @@ class PlayerEngine:
         for ch in range(16):
             bank = 128 if ch == 9 else 0  # channel 10 (index 9) is GM percussion
             fs.program_select(ch, sfid, bank, 0)
+        fs.program_select(CHORD_CHANNEL, sfid, 0, 0)  # synthesized chords: piano
 
     def close(self) -> None:
         self.stop()
@@ -463,6 +480,79 @@ class PlayerEngine:
             self._pos_base = 0.0
             self._cursor = 0
         return self.song
+
+    def _chord_events(
+        self, index: int, chord_notes: list[tuple[float, float, tuple[int, ...]]]
+    ) -> tuple[list[_Event], list[tuple[float, float, int]]]:
+        """Build the note events and lane notes for a synthesized chord track.
+
+        The first note of each chord (the bass) is voiced slightly louder.
+        """
+        events: list[_Event] = []
+        track_notes: list[tuple[float, float, int]] = []
+        for start, end, pitches in chord_notes:
+            for i, note_num in enumerate(pitches):
+                velocity = 78 if i == 0 else 58
+                on = _SynthMessage("note_on", CHORD_CHANNEL, note_num, velocity)
+                off = _SynthMessage("note_off", CHORD_CHANNEL, note_num, 0)
+                events.append(_Event(start, _message_order(on), index, on))
+                events.append(_Event(end, _message_order(off), index, off))
+                track_notes.append((start, end, note_num))
+        return events, sorted(track_notes)
+
+    def add_chord_track(
+        self,
+        chord_notes: list[tuple[float, float, tuple[int, ...]]],
+        *,
+        name: str = "Chords (piano)",
+    ) -> TrackInfo:
+        """Append a synthesized track playing ``(start, end, midi_notes)`` chords.
+
+        The track behaves like any loaded track (solo/mute, seek, offline render)
+        but lives on :data:`CHORD_CHANNEL`, beyond the MIDI file's 16 channels.
+        """
+        with self._lock:
+            index = max((t.index for t in self.song.tracks), default=-1) + 1
+            events, track_notes = self._chord_events(index, chord_notes)
+            self.song.events.extend(events)
+            self.song.events.sort(key=lambda e: (e.time, e.order))
+            info = TrackInfo(
+                index=index,
+                name=name,
+                program=0,
+                is_drum=False,
+                channels=(CHORD_CHANNEL,),
+                note_count=len(track_notes),
+                notes=track_notes,
+            )
+            self.song.tracks.append(info)
+        return info
+
+    def update_chord_track(
+        self, index: int, chord_notes: list[tuple[float, float, tuple[int, ...]]]
+    ) -> None:
+        """Replace a synthesized chord track's notes (e.g. on a style change).
+
+        Keeps the track index — and with it the solo/mute state and lane wiring —
+        and resumes playback from the current position if it was playing.
+        """
+        was_playing = self._playing
+        position = self.position()
+        self._halt_thread()
+        with self._lock:
+            self.song.events = [e for e in self.song.events if e.track != index]
+            events, track_notes = self._chord_events(index, chord_notes)
+            self.song.events.extend(events)
+            self.song.events.sort(key=lambda e: (e.time, e.order))
+            for info in self.song.tracks:
+                if info.index == index:
+                    info.note_count = len(track_notes)
+                    info.notes = track_notes
+                    break
+        self._pos_base = position
+        self._cursor = self._index_at(position)
+        if was_playing:
+            self.play()
 
     # -- dispatch --------------------------------------------------------
     def _dispatch(self, event: _Event) -> None:
@@ -565,7 +655,7 @@ class PlayerEngine:
         with self._lock:
             if self._fs is None:
                 return
-            for ch in range(16):
+            for ch in (*range(16), CHORD_CHANNEL):
                 self._fs.cc(ch, 123, 0)
                 self._fs.cc(ch, 120, 0)
 
