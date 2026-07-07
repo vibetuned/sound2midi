@@ -18,10 +18,17 @@ player = [
     "numpy>=1.26",
     "music21>=9.1",
 ]
+# MusicXML -> MEI conversion (sound2midi-mei). Install with: uv sync --extra mei
+mei = [
+    "music21>=9.1",
+    "verovio==5.7.0",
+    "lxml>=5",
+]
 
 [project.scripts]
 sound2midi = "sound2midi.cli:main"
 sound2midi-play = "sound2midi.player.app:main"
+sound2midi-mei = "sound2midi.mei:main"
 
 [dependency-groups]
 dev = [

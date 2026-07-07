@@ -322,6 +322,29 @@ present, `abc/<midi>.<single|grand|split>.abc` (MusicXML → ABC via that script
 audio, the MIDIs, and the pipeline artifacts. Conversion uses
 [music21](https://web.mit.edu/music21/) (installed with the `player` extra).
 
+### MusicXML → MEI (`sound2midi-mei`)
+
+Converts exported MusicXML to [MEI](https://music-encoding.org/) with
+[Verovio](https://www.verovio.org/) 5.7, prepending a **lead-in "measure 0"**
+holding a single quarter rest (the convention the consuming trainer app
+expects). The part's opening clef / key / time signature move onto the new
+first measure so Verovio still lifts them into the top `<scoreDef>`; grand
+staves get the rest in both staves and chord symbols pass through as `<harm>`
+elements.
+
+```bash
+uv sync --extra mei                                                   # one-time
+uv run sound2midi-mei output/<id>/musicxml/<id>.stems.single.musicxml
+# -> output/<id>/mei/<id>.stems.single.mei
+```
+
+A file living in a `musicxml/` folder lands in a sibling `mei/` folder;
+anything else gets a `.mei` written alongside it (`-o` overrides either way).
+`--no-zero-measure` skips the lead-in bar, `--mei-version` retargets the
+declared MEI version (default 5.1). The music21 round-trip's inflated timing
+resolution (`@ppq` 10080) is rescaled to a clean 128, and Verovio's
+`metcon="false"` flags on the incomplete lead-in bar are stripped.
+
 ## Options
 
 | Flag | Meaning |
