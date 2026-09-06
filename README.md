@@ -47,12 +47,36 @@ dependencies. Instead, on first use it is cloned into a cache directory with its
 ## Requirements
 
 - `uv`, `git`, and `ffmpeg` on your PATH.
+- YouTube downloads work out of the box: the `yt-dlp[default,deno]` dependency
+  bundles the JS-challenge solver and its runtime (without them YouTube rejects
+  media downloads with HTTP 403), and if the default download is still blocked
+  (network-level PO-token enforcement: HTTP 403 or "Requested format is not
+  available"), the downloader automatically retries with the android player
+  client and then with HLS formats, extracting the audio from whatever it gets.
 - An NVIDIA GPU is strongly recommended. The AMT model pins `torch==2.7.0+cu128`
   (CUDA 12.8, with Blackwell/RTX-50 support). CPU inference works via `--device cpu`
   but is very slow.
 - For the player: a FluidSynth soundfont. On Debian/Ubuntu: `sudo apt install
   fluid-soundfont-gm` (provides `/usr/share/sounds/sf2/FluidR3_GM.sf2`). The synth
   library itself ships with the `pyfluidsynth` wheel.
+
+### macOS
+
+Works on Apple Silicon and Intel Macs — the CUDA-pinned requirements are rewritten
+to the plain PyPI torch build automatically, and inference defaults to CPU
+(pass `--device mps` to try the Apple GPU; experimental). Expect transcription to
+be much slower than on an NVIDIA GPU.
+
+```bash
+brew install ffmpeg fluid-synth   # fluid-synth is the player's synth library
+```
+
+Homebrew has no GM soundfont package, so for the player either install
+[MuseScore](https://musescore.org) (its bundled `MS Basic.sf3` is found
+automatically) or download
+[FluidR3_GM.sf2](https://member.keymusician.com/Member/FluidR3_GM/index.html)
+into `~/Library/Audio/Sounds/Banks/`, or point `$SOUND2MIDI_SOUNDFONT` at any
+`.sf2`/`.sf3` file.
 
 ## Setup
 

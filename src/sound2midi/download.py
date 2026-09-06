@@ -5,6 +5,29 @@ from __future__ import annotations
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
+
+# YouTube rejects the default clients' direct (https) downloads with HTTP 403 on
+# some networks (PO-token enforcement), or PO-token-gates their formats entirely
+# ("Requested format is not available"). Two things keep working there and are
+# tried in order: the android player client (served URLs that are not IP-gated),
+# and HLS formats. Both may yield a video+audio format (HLS capped in resolution
+# to keep the download small); ffmpeg extracts the audio track afterwards.
+_FALLBACKS: tuple[tuple[str, dict[str, object]], ...] = (
+    (
+        "the android player client",
+        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+    ),
+    (
+        "HLS formats",
+        {"format": "ba*[protocol^=m3u8][height<=480]/ba*[protocol^=m3u8]/b[protocol^=m3u8]"},
+    ),
+)
+
+
+def _is_format_blocked(exc: DownloadError) -> bool:
+    msg = str(exc)
+    return "403" in msg or "Requested format is not available" in msg
 
 
 def probe_id(url: str) -> str:
@@ -63,8 +86,18 @@ def download_audio(
         "noprogress": quiet,
     }
 
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    attempts: list[tuple[str | None, dict[str, object]]] = [(None, {}), *_FALLBACKS]
+    for i, (_label, overrides) in enumerate(attempts):
+        try:
+            with YoutubeDL({**ydl_opts, **overrides}) as ydl:
+                ydl.download([url])
+            break
+        except DownloadError as exc:
+            if not _is_format_blocked(exc) or i == len(attempts) - 1:
+                raise
+            if not quiet:
+                next_label = attempts[i + 1][0]
+                print(f"Download was rejected by YouTube; retrying with {next_label} ...")
 
     if not audio_path.exists():
         raise FileNotFoundError(

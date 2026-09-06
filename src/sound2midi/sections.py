@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from sound2midi.amt import _run, _uv, _venv_python
+from sound2midi.amt import _default_device, _run, _uv, _venv_python
 
 SONGFORMER_REPO_URL = "https://github.com/ASLP-lab/SongFormer.git"
 SONGFORMER_REF = "main"
@@ -31,9 +31,14 @@ SONGFORMER_SUBMODULE = "src/third_party/musicfm"
 SONGFORMER_PYTHON_VERSION = "3.10"
 
 # Same torch build as the AMT venv: cu128 has Blackwell (RTX 50) kernels, which
-# the upstream torch==2.4.0 pin lacks.
-TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
-TORCH_DEPS = ("torch==2.7.0+cu128", "torchaudio==2.7.0+cu128")
+# the upstream torch==2.4.0 pin lacks. On macOS there are no CUDA wheels, so we
+# take the plain PyPI (CPU/MPS) build of the same version instead.
+if sys.platform == "darwin":
+    TORCH_INDEX_URL = None
+    TORCH_DEPS = ("torch==2.7.0", "torchaudio==2.7.0")
+else:
+    TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+    TORCH_DEPS = ("torch==2.7.0+cu128", "torchaudio==2.7.0+cu128")
 
 # The runtime subset of the upstream requirements.txt, at the upstream pins:
 # training/eval/demo-only packages (lightning, wandb, gradio, pesq, ...) are
@@ -112,18 +117,8 @@ def ensure_env(home: Path, *, reinstall: bool = False) -> Path:
     uv = _uv()
     _run([uv, "venv", "--python", SONGFORMER_PYTHON_VERSION, str(venv_dir)])
     # torch first, from the cu128 index, so nothing pulls the PyPI build transitively.
-    _run(
-        [
-            uv,
-            "pip",
-            "install",
-            "--python",
-            str(python),
-            "--extra-index-url",
-            TORCH_INDEX_URL,
-            *TORCH_DEPS,
-        ]
-    )
+    index_args = ["--extra-index-url", TORCH_INDEX_URL] if TORCH_INDEX_URL else []
+    _run([uv, "pip", "install", "--python", str(python), *index_args, *TORCH_DEPS])
     _run([uv, "pip", "install", "--python", str(python), *SECTIONS_DEPS])
 
     marker.write_text("ok\n")
@@ -174,7 +169,7 @@ def detect_sections(
         "--audio",
         str(audio_path.resolve()),
         "--device",
-        device or "cuda",  # the script falls back to CPU if CUDA is unusable
+        device or _default_device(),  # the script falls back to CPU if CUDA is unusable
     ]
     if output_json is not None:
         cmd += ["--output-json", str(output_json.resolve())]

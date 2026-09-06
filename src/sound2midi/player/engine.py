@@ -9,12 +9,21 @@ event at dispatch time, so tracks can be toggled while playing ("separate vs tog
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# pyfluidsynth's macOS fallback looks for the Homebrew libfluidsynth via
+# $HOMEBREW_PREFIX, which is only set in shells that ran `brew shellenv`.
+if sys.platform == "darwin" and "HOMEBREW_PREFIX" not in os.environ:
+    for _prefix in ("/opt/homebrew", "/usr/local"):
+        if Path(_prefix, "lib", "libfluidsynth.dylib").exists():
+            os.environ["HOMEBREW_PREFIX"] = _prefix
+            break
 
 import fluidsynth
 import mido
@@ -153,11 +162,20 @@ GM_INSTRUMENTS: tuple[str, ...] = (
 
 # Soundfonts to try, in order, when none is given.
 _SOUNDFONT_CANDIDATES = (
+    # Linux distro packages
     "/usr/share/sounds/sf2/FluidR3_GM.sf2",
     "/usr/share/sounds/sf2/default-GM.sf2",
     "/usr/share/sounds/sf3/MuseScore_General.sf3",
     "/usr/share/sounds/sf3/default-GM.sf3",
     "/usr/share/sounds/sf2/TimGM6mb.sf2",
+    # macOS: user-dropped fonts, then the MuseScore app's bundled GM font
+    str(Path.home() / "Library/Audio/Sounds/Banks/FluidR3_GM.sf2"),
+    "/opt/homebrew/share/soundfonts/FluidR3_GM.sf2",
+    "/usr/local/share/soundfonts/FluidR3_GM.sf2",
+    "/Applications/MuseScore 4.app/Contents/Resources/sound/MS Basic.sf3",
+    "/Applications/MuseScore 3.app/Contents/Resources/sound/MuseScore_General.sf3",
+    # Generic per-user location (any platform)
+    str(Path.home() / ".local/share/soundfonts/FluidR3_GM.sf2"),
 )
 
 _CHANNEL_MESSAGE_TYPES = frozenset(
@@ -187,7 +205,8 @@ def find_soundfont(override: str | None = None) -> Path:
         if candidate and Path(candidate).is_file():
             return Path(candidate)
     raise FileNotFoundError(
-        "No soundfont found. Install one (e.g. `fluid-soundfont-gm`) or set "
+        "No soundfont found. Install one (Linux: `fluid-soundfont-gm`; macOS: "
+        "download FluidR3_GM.sf2 into ~/Library/Audio/Sounds/Banks/) or set "
         "$SOUND2MIDI_SOUNDFONT to a .sf2/.sf3 file."
     )
 

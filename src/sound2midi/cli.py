@@ -58,9 +58,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--device",
-        choices=("cuda", "cpu"),
+        choices=("cuda", "cpu", "mps"),
         default=None,
-        help="Inference device. Defaults to CUDA when available.",
+        help="Inference device. Defaults to CUDA when available, else CPU. "
+        "'mps' (Apple GPU) is experimental.",
     )
     parser.add_argument(
         "--no-amp",

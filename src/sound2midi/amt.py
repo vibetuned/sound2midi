@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,29 @@ def _venv_python(home: Path) -> Path:
     return home / ".venv" / "bin" / "python"
 
 
+def _default_device() -> str:
+    """Default inference device: CUDA where it can exist, CPU on macOS."""
+    return "cpu" if sys.platform == "darwin" else "cuda"
+
+
+def _portable_requirements(requirements: Path, venv_dir: Path) -> Path:
+    """On macOS, rewrite a CUDA-pinned requirements file to the plain PyPI builds.
+
+    CUDA wheels (``+cu128``) and the pytorch.org CUDA index don't exist for
+    macOS; the same versions from PyPI ship the CPU/MPS build instead.
+    """
+    if sys.platform != "darwin":
+        return requirements
+    lines = [
+        re.sub(r"\+cu\d+", "", line)
+        for line in requirements.read_text().splitlines()
+        if "download.pytorch.org/whl/cu" not in line
+    ]
+    filtered = venv_dir / "requirements-macos.txt"
+    filtered.write_text("\n".join(lines) + "\n")
+    return filtered
+
+
 def ensure_repo(home: Path, *, ref: str = AMT_REF) -> Path:
     """Clone the AMT repo into ``home`` if it is not already there."""
     if (home / ".git").exists():
@@ -95,6 +119,7 @@ def ensure_env(home: Path, *, reinstall: bool = False) -> Path:
     requirements = home / "requirements.txt"
     if not requirements.exists():
         raise FileNotFoundError(f"No requirements.txt found in AMT repo at {home}.")
+    requirements = _portable_requirements(requirements, venv_dir)
     _run([uv, "pip", "install", "--python", str(python), "-r", str(requirements)])
 
     marker.write_text("ok\n")
@@ -309,7 +334,7 @@ def detect_meter(
         "--audio",
         str(audio_path.resolve()),
         "--device",
-        device or "cuda",
+        device or _default_device(),
     ]
     if midi_path is not None and midi_path.exists():
         cmd += ["--midi", str(midi_path.resolve())]
@@ -414,7 +439,7 @@ def detect_key(
         "--audio",
         str(audio_path.resolve()),
         "--device",
-        device or "cuda",  # skey falls back to CPU if CUDA is unavailable
+        device or _default_device(),  # skey falls back to CPU if CUDA is unavailable
     ]
     if output_json is not None:
         cmd += ["--output-json", str(output_json.resolve())]

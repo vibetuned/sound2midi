@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "yt-dlp>=2024.0.0",
+    # [default] brings yt-dlp-ejs (the YouTube JS-challenge solver — without it
+    # media downloads 403); [deno] provides the JS runtime the solver needs.
+    "yt-dlp[default,curl-cffi,deno]>=2026.7.4",
 ]
 
 [project.optional-dependencies]
