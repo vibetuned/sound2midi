@@ -399,6 +399,9 @@ uv sync --extra mpe                                    # one-time
 uv run sound2midi-mpe output/<id>/<id>.stems.mid       # -> <id>.stems.mpe.mid
 uv run sound2midi-mpe output/<id>/stems/midi/<id>_vocals.mid   # one stem alone
 uv run sound2midi-mpe song.mid --profile strings --bend-range 48 --seed 7
+uv run sound2midi-mpe song.mid --wind    # simulate a wind MIDI instrument:
+#   winds profile, top voice only (monophonic), breath-shaped pressure
+#   (soft onset, air depletion, phrase-end taper), mirrored onto breath CC2
 
 # stream to a DAW over a virtual MIDI port ("sound2midi MPE")
 uv run sound2midi-mpe-play output/<id>/<id>.stems.mpe.mid

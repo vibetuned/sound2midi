@@ -169,3 +169,26 @@ def test_per_stem_midi_finds_song_context(tmp_path, capsys):
     mid = mido.MidiFile(str(dest))
     velocities = [m.velocity for t in mid.tracks for m in t if m.type == "note_on"]
     assert velocities[-1] > velocities[0]
+
+
+def test_wind_flag_renders_breath_and_monophony(tmp_path, capsys):
+    # two-note chords under a melody: --wind must keep only the top voice
+    chords = [[(60 + i, 0.5 + i * 0.7, 0.6), (48 + i, 0.5 + i * 0.7, 0.6)] for i in range(8)]
+    make_midi(tmp_path / "duo.mid", [[n for pair in chords for n in pair]])
+    out = tmp_path / "wind.mid"
+    assert render_main([str(tmp_path / "duo.mid"), "--wind", "--seed", "2", "-o", str(out)]) == 0
+    assert "profile=winds" in capsys.readouterr().err
+    mid = mido.MidiFile(str(out))
+    messages = [m for track in mid.tracks for m in track]
+    note_ons = [m for m in messages if m.type == "note_on"]
+    assert len(note_ons) == 8  # top voice only
+    assert {m.note for m in note_ons} == {60 + i for i in range(8)}
+    breath = [m for m in messages if m.type == "control_change" and m.control == 2]
+    assert len(breath) > 8  # a real breath stream, not just per-note setup
+
+    # without --wind: full polyphony, no breath CC
+    plain = tmp_path / "plain.mid"
+    assert render_main([str(tmp_path / "duo.mid"), "--seed", "2", "-o", str(plain)]) == 0
+    messages = [m for track in mido.MidiFile(str(plain)).tracks for m in track]
+    assert len([m for m in messages if m.type == "note_on"]) == 16
+    assert not any(m.type == "control_change" and m.control == 2 for m in messages)

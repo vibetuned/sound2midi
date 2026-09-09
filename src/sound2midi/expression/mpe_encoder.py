@@ -132,11 +132,14 @@ def encode(
     *,
     bend_range: int = DEFAULT_BEND_RANGE,
     cc74_floor: int = CC74_FLOOR,
+    breath_cc: int | None = None,
 ) -> list[TimedMessage]:
     """Encode performance notes into a time-sorted MPE message stream.
 
     The handshake is not included — prepend :func:`handshake_messages` at the
-    start of the file/stream.
+    start of the file/stream. ``breath_cc`` (e.g. 2 for --wind) mirrors the
+    pressure stream onto that controller, so wind-instrument patches that
+    listen to breath CC respond alongside MPE channel pressure.
     """
     channels, ends = _allocate_channels(notes)
     events: list[TimedMessage] = []
@@ -158,6 +161,12 @@ def encode(
         cc74 = round(min(127.0, max(0.0, first[2])))
         emit(note.start, _PRI_SETUP, mido.Message("pitchwheel", channel=channel, pitch=bend))
         emit(note.start, _PRI_SETUP, mido.Message("aftertouch", channel=channel, value=pressure))
+        if breath_cc is not None:
+            emit(
+                note.start,
+                _PRI_SETUP,
+                mido.Message("control_change", channel=channel, control=breath_cc, value=pressure),
+            )
         emit(
             note.start,
             _PRI_SETUP,
@@ -175,6 +184,14 @@ def encode(
             value = round(min(127.0, max(0.0, raw_pressure)))
             if value != last_pressure and t - t_pressure >= PRESSURE_MIN_DT:
                 emit(t, _PRI_STREAM, mido.Message("aftertouch", channel=channel, value=value))
+                if breath_cc is not None:  # breath rides the pressure cadence
+                    emit(
+                        t,
+                        _PRI_STREAM,
+                        mido.Message(
+                            "control_change", channel=channel, control=breath_cc, value=value
+                        ),
+                    )
                 last_pressure = value
                 t_pressure = t
             value = round(min(127.0, max(0.0, raw_cc74)))
@@ -201,6 +218,12 @@ def encode(
         # (mido pitchwheel center is 0, not 8192).
         emit(end, _PRI_OFF, mido.Message("pitchwheel", channel=channel, pitch=0))
         emit(end, _PRI_OFF, mido.Message("aftertouch", channel=channel, value=0))
+        if breath_cc is not None:
+            emit(
+                end,
+                _PRI_OFF,
+                mido.Message("control_change", channel=channel, control=breath_cc, value=0),
+            )
         emit(
             end,
             _PRI_OFF,

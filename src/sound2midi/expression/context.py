@@ -13,6 +13,7 @@ import math
 import statistics
 from bisect import bisect_right
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 
 import mido
@@ -262,6 +263,24 @@ def extract_tracks(mid: mido.MidiFile) -> list[TrackData]:
             TrackData(index=index, name=name, program=program, is_drum=is_drum, notes=notes)
         )
     return tracks
+
+
+def reduce_to_top_voice(track: TrackData) -> None:
+    """Keep only the highest concurrent note per attack (wind instruments are
+    monophonic), clipping any remaining overlap to a small legato-friendly one."""
+    clusters: list[list[Note]] = []
+    for note in sorted(track.notes, key=lambda n: (n.start, -n.pitch)):
+        if clusters and note.start - clusters[-1][0].start <= CHORD_CLUSTER_S:
+            clusters[-1].append(note)
+        else:
+            clusters.append([note])
+    top = [max(cluster, key=lambda n: n.pitch) for cluster in clusters]
+    for current, upcoming in pairwise(top):
+        limit = upcoming.start + 0.02
+        if current.end > limit:
+            current.end = limit
+            current.perf_end = limit
+    track.notes = top
 
 
 def _segment_at(segments: list[tuple[str, float, float]], t: float) -> str | None:

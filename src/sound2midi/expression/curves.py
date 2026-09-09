@@ -215,8 +215,15 @@ def _sample_streams(
     glide: list[_GlideSegment] | None = None,
     bumps: list[tuple[float, float]] | None = None,  # (time offset, amplitude)
     loudness: list[float] | None = None,
+    breath: bool = False,
 ) -> list[tuple[float, float, float, float]]:
-    """Sample (t, pressure, cc74, cents) at 60 Hz over ``duration`` seconds."""
+    """Sample (t, pressure, cc74, cents) at 60 Hz over ``duration`` seconds.
+
+    ``breath`` shapes the pressure like a wind player's air column: no
+    percussive attack (breath builds over ~60 ms instead), support dropping
+    slightly as the phrase spends its air, and a taper on the phrase-final
+    note; legato-joined notes keep the column going without re-attacking.
+    """
     jitter = _NoteJitter.draw(rng)
     drift = _Drift(rng)
     dt = 1.0 / SAMPLE_HZ
@@ -233,7 +240,7 @@ def _sample_streams(
         if profile.swell
         else 0.0
     )
-    a_att = 25.0 * (velocity / 96.0) * att_scale if profile.attack else 0.0
+    a_att = 25.0 * (velocity / 96.0) * att_scale if profile.attack and not breath else 0.0
     decay_tau = max(0.25, 0.6 * duration)  # pluck/keys pressure decay
 
     vibrato_on = profile.vibrato and duration >= 0.35
@@ -260,6 +267,13 @@ def _sample_streams(
                 for bump_t, bump_amp in bumps:
                     if t >= bump_t:
                         pressure += bump_amp * math.exp(-(t - bump_t) / 0.08)
+            if breath:
+                envelope = 1.0 - 0.15 * min(1.0, max(0.0, note.phrase_pos))  # air spent
+                if not note.legato_prev:
+                    envelope *= _smoothstep(t / 0.06)  # breath builds
+                if note.phrase_final and u > 0.7:
+                    envelope *= 1.0 - 0.5 * _smoothstep((u - 0.7) / 0.3)  # release taper
+                pressure *= envelope
             pressure += drift.step(dt)
             if loudness is not None and k < len(loudness):
                 pressure = 0.5 * pressure + 0.5 * (127.0 * loudness[k])
@@ -304,6 +318,7 @@ class RenderOptions:
     loudness_pressure: bool = False
     loudness_curve: StemCurve | None = None  # the track's stem loudness
     dry: bool = False  # velocity only, expression muted (A/B)
+    breath: bool = False  # wind-instrument pressure shaping (--wind)
 
 
 _DRY_PROFILE = Profile(name="none", pressure=False, vibrato=False, cc74=False)
@@ -400,6 +415,7 @@ def _render_glide(
         glide=segments,
         bumps=bumps,
         loudness=_loudness_samples(options, root.perf_start, duration),
+        breath=options.breath,
     )
     return PerfNote(
         track=track.index,
@@ -444,6 +460,7 @@ def _render_overlap(
             rng=rng,
             att_scale=att_scale,
             loudness=_loudness_samples(options, note.perf_start, duration),
+            breath=options.breath,
         )
         perf.append(
             PerfNote(

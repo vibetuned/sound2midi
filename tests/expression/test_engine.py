@@ -276,3 +276,58 @@ def test_match_port():
         match_port(ports, "i")  # in Vital, ROLI, Session...
     with pytest.raises(SystemExit):
         match_port(ports, "does-not-exist")
+
+
+# --- --wind: wind-instrument simulation -----------------------------------------
+
+
+def test_reduce_to_top_voice_keeps_highest_and_clips_overlap():
+    from sound2midi.expression.context import reduce_to_top_voice
+
+    chord = [make_note(p, 0.0, 2.0) for p in (60, 64, 67)]  # held triad
+    melody = [make_note(72, 1.0, 0.5)]
+    track = make_track(chord + melody)
+    reduce_to_top_voice(track)
+    assert [n.pitch for n in track.notes] == [67, 72]
+    assert track.notes[0].end <= 1.0 + 0.02 + 1e-9  # clipped to a legato overlap
+
+
+def test_breath_builds_instead_of_attacking():
+    winds = curves.load_profile("winds")
+    note = make_note(60, 0.0, 2.0, tension=0.5, phrase_pos=0.5)
+
+    def first_pressures(breath):
+        track = make_track([make_note(60, 0.0, 2.0, tension=0.5, phrase_pos=0.5)])
+        rng = random.Random(4)
+        groups = curves.detect_legato(track, winds, "off", 48)
+        velocity.synthesize(track, rng)
+        options = curves.RenderOptions(legato_mode="off", breath=breath)
+        (perf,) = curves.render_track(track, groups, winds, rng, options)
+        return [p for _, p, _, _ in perf.samples[:8]]
+
+    percussive = first_pressures(breath=False)
+    breathy = first_pressures(breath=True)
+    assert breathy[0] < 8.0  # breath starts from (almost) nothing
+    assert breathy[0] < breathy[4] < breathy[7] + 6  # and builds
+    assert percussive[0] > breathy[0] + 15  # vs the percussive transient
+
+    # a legato-joined note keeps the air column: no re-ramp from zero
+    note.legato_prev = True
+    track = make_track([note])
+    rng = random.Random(4)
+    options = curves.RenderOptions(legato_mode="off", breath=True)
+    (perf,) = curves.render_track(track, [[note]], winds, rng, options)
+    assert perf.samples[0][1] > 10.0
+
+
+def test_breath_cc_mirrors_pressure():
+    from sound2midi.expression.mpe_encoder import encode as enc
+
+    winds = curves.load_profile("winds")
+    perf = render_notes([make_note(60, 0.0, 1.5, tension=0.5)], winds)
+    plain = enc(perf)
+    breathy = enc(perf, breath_cc=2)
+    assert not any(m.type == "control_change" and m.control == 2 for _, _, _, m in plain)
+    cc2 = [(t, m.value) for t, _, _, m in breathy if m.type == "control_change" and m.control == 2]
+    touch = [(t, m.value) for t, _, _, m in breathy if m.type == "aftertouch"]
+    assert cc2 == touch  # breath rides the pressure cadence, value for value

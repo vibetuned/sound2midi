@@ -100,6 +100,14 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Velocity only, expression streams muted (for A/B comparison).",
     )
+    parser.add_argument(
+        "--wind",
+        action="store_true",
+        help="Simulate a wind MIDI instrument: winds profile everywhere, tracks "
+        "reduced to their top voice (winds are monophonic), pressure shaped like "
+        "breath (soft onset, air depletion, phrase-end taper) and mirrored onto "
+        "breath CC2 for wind-synth patches. --profile/--track-profile still win.",
+    )
 
 
 def _profile_overrides(entries: list[str]) -> dict[str, str]:
@@ -180,6 +188,10 @@ def build_performance(args: argparse.Namespace) -> Performance:
         _log(f"Artifacts missing (using fallbacks): {', '.join(artifacts.missing)}")
 
     tracks = context.extract_tracks(mid)
+    if args.wind:
+        for track in tracks:
+            if not track.is_drum and track.notes:
+                context.reduce_to_top_voice(track)
     context.annotate(tracks, artifacts, mid.ticks_per_beat)
 
     if args.rubato > 0:
@@ -206,7 +218,8 @@ def build_performance(args: argparse.Namespace) -> Performance:
     for track in tracks:
         if not track.notes or (args.solo_track is not None and track.index != args.solo_track):
             continue
-        profile = _resolve_profile(track, args.profile, overrides, hint)
+        forced = args.profile or ("winds" if args.wind else None)
+        profile = _resolve_profile(track, forced, overrides, hint)
 
         groups = curves.detect_legato(track, profile, args.legato, args.bend_range)
 
@@ -225,13 +238,15 @@ def build_performance(args: argparse.Namespace) -> Performance:
             legato_mode=args.legato,
             loudness_pressure=args.loudness_pressure,
             loudness_curve=stem_curve,
-            dry=getattr(args, "dry", False),
+            dry=args.dry,
+            breath=args.wind and not args.dry,
         )
         label = track.name or f"track {track.index}"
         _log(f"  {label}: profile={profile.name}, {len(track.notes)} notes")
         perf_notes.extend(curves.render_track(track, groups, profile, rng, options))
 
-    events = encoder.encode(perf_notes, bend_range=args.bend_range)
+    breath_cc = 2 if args.wind and not args.dry else None
+    events = encoder.encode(perf_notes, bend_range=args.bend_range, breath_cc=breath_cc)
     return Performance(mid=mid, events=events, perf_notes=perf_notes, bend_range=args.bend_range)
 
 
