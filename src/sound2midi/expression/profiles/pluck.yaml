@@ -1,0 +1,7 @@
+# Plucked (guitar/bass): attack transient + decay only, no swell, no vibrato;
+# CC74 tracks the decay.
+name: pluck
+swell: false
+vibrato: false
+cc74_tracks_decay: true
+legato: "off"

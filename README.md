@@ -369,6 +369,60 @@ declared MEI version (default 5.1). The music21 round-trip's inflated timing
 resolution (`@ppq` 10080) is rescaled to a clean 128, and Verovio's
 `metcon="false"` flags on the incomplete lead-in bar are stripped.
 
+## MPE expression engine (`sound2midi-mpe`)
+
+> Not to be confused with `sound2midi-mei` above — **MPE** is *MIDI Polyphonic
+> Expression* (per-note channels carrying pressure/CC74/bend); MEI is the
+> notation format.
+
+Transcribed or score-derived MIDI plays flat on MPE synths. `sound2midi-mpe`
+takes a MIDI file plus the song's artifacts (`meter.json` beat grid,
+`key.json`, `chords.json`, `sections.json` — all optional, discovered
+automatically from the song-folder layout, `--artifacts-dir` overrides) and
+works on the merged file **or on a single per-stem MIDI** under
+`stems/midi/` — the song's artifacts, the stem's WAV (for loudness dynamics)
+and the right instrument profile are all found from the `<id>_<stem>.mid`
+name — and
+synthesizes a full MPE performance: velocities from musical context (or from
+**stem loudness** when `stems/` WAVs exist), per-note **channel pressure**
+swells, **CC74** brightness, phase-accumulated **vibrato**, a shared
+**rubato** time-warp (`--rubato`, capped at 80 ms so it never leaves the beat
+grid), and **legato** — pitch-bend glides for voice, overlapped bows for
+strings/winds (`--legato`). Instrument profiles auto-select from stem track
+names (`vocals→sung`, `guitar`/`bass→pluck`, `piano→keys`, `drums→none`,
+else `strings`); `--profile` forces one, `--track-profile NAME=PROFILE`
+overrides per track. All randomness is seedable: a fixed `--seed` reproduces
+the file byte-for-byte.
+
+```bash
+uv sync --extra mpe                                    # one-time
+uv run sound2midi-mpe output/<id>/<id>.stems.mid       # -> <id>.stems.mpe.mid
+uv run sound2midi-mpe output/<id>/stems/midi/<id>_vocals.mid   # one stem alone
+uv run sound2midi-mpe song.mid --profile strings --bend-range 48 --seed 7
+
+# stream to a DAW over a virtual MIDI port ("sound2midi MPE")
+uv run sound2midi-mpe-play output/<id>/<id>.stems.mpe.mid
+uv run sound2midi-mpe-play output/<id>/<id>.stems.mid --live   # render on the fly
+# (without --live, any file is streamed exactly as-is — plain MIDI stays plain)
+uv run sound2midi-mpe-play song.mid --live --dry               # velocity-only A/B
+
+# hardware / network destinations never subscribe to sources, so reach them
+# with --port; the virtual source stays open alongside, so subscribing apps
+# (a DAW, listener apps) keep receiving too
+uv run sound2midi-mpe-play --list-ports                        # what's out there
+uv run sound2midi-mpe-play song.mpe.mid --port ROLI --port iPad
+uv run sound2midi-mpe-play song.mpe.mid --port all             # every destination
+uv run sound2midi-mpe-play song.mpe.mid --port all --no-virtual  # devices only
+```
+
+Renders default to a **48-semitone** pitch-bend range (`--bend-range`) so
+legato glides have headroom; the handshake configures it on the synth via
+RPN 0. A `.mpe.mid` with glides is a *performance render* — inner notes of a
+legato chain are bend travel, not note events, so it is not a notation/re-edit
+source. The realtime player is for MPE synths in a DAW (Vital, Surge XT,
+Bitwig, Ableton 11+); the built-in `sound2midi-play` player stays
+FluidSynth-based and non-MPE.
+
 ## Options
 
 | Flag | Meaning |

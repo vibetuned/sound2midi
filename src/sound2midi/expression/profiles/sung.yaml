@@ -1,0 +1,7 @@
+# Voice: slower pressure attack, deeper + later vibrato, glide legato.
+name: sung
+attack_time: 0.06
+vib_depth: 1.3
+vib_onset: 1.4
+legato: glide
+legato_interval: 7.0

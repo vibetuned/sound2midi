@@ -1,0 +1,4 @@
+# Bowed strings: full pressure/vibrato/CC74, bowed connections via overlap.
+name: strings
+legato: overlap
+legato_interval: 4.0

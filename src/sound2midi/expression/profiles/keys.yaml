@@ -1,0 +1,6 @@
+# Keyboards (piano): like pluck — attack + decay, no swell, no vibrato.
+name: keys
+swell: false
+vibrato: false
+cc74_tracks_decay: true
+legato: "off"

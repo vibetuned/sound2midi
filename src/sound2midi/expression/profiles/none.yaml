@@ -1,0 +1,6 @@
+# No expression (drums / explicit opt-out): velocity synthesis only.
+name: none
+pressure: false
+vibrato: false
+cc74: false
+legato: "off"
