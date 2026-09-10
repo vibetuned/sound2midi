@@ -245,11 +245,15 @@ def write_file(
     dest: str,
     *,
     bend_range: int = DEFAULT_BEND_RANGE,
+    handshake: bool = True,
+    track_name: str = "MPE performance",
 ) -> None:
-    """Write the MPE performance as a Type 1 file at PPQ 480.
+    """Write the event stream as a Type 1 file at PPQ 480.
 
     The source tempo map (and time signatures) are preserved — re-ticked to
     the new PPQ — so the file stays aligned with ``meter.json`` and the audio.
+    ``handshake=False`` writes a plain event file (e.g. the --airwave
+    companion), without the MPE zone configuration.
     """
     out = mido.MidiFile(type=1, ticks_per_beat=FILE_PPQ)
     scale = FILE_PPQ / src.ticks_per_beat
@@ -278,11 +282,12 @@ def write_file(
 
     sec_to_tick = sec_to_tick_fn(out)
     performance = mido.MidiTrack()
-    performance.append(mido.MetaMessage("track_name", name="MPE performance", time=0))
+    performance.append(mido.MetaMessage("track_name", name=track_name, time=0))
     tick = 0
-    for msg in handshake_messages(bend_range):
-        msg.time = 0
-        performance.append(msg)
+    if handshake:
+        for msg in handshake_messages(bend_range):
+            msg.time = 0
+            performance.append(msg)
     for time, _, _, msg in events:
         abs_tick = max(0, sec_to_tick(time))
         msg = msg.copy()

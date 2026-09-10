@@ -402,6 +402,13 @@ uv run sound2midi-mpe song.mid --profile strings --bend-range 48 --seed 7
 uv run sound2midi-mpe song.mid --wind    # simulate a wind MIDI instrument:
 #   winds profile, top voice only (monophonic), breath-shaped pressure
 #   (soft onset, air depletion, phrase-end taper), mirrored onto breath CC2
+uv run sound2midi-mpe song.mid --airwave gestures.mid   # + an Airwave gesture
+#   layer for midi-sink, driven by ANOTHER MIDI file's content and merged into
+#   the same .mpe.mid: the source's energy sways the vortex and the ripples,
+#   its melody's contour and attacks steer the swirl, its accents land the
+#   pinch folds (downbeats, section changes, phrase peaks) — all as channel-1
+#   CCs (20-29), on the song's beat grid so everything stays in sync. Works
+#   the same on sound2midi-mpe-play --live.
 
 # stream to a DAW over a virtual MIDI port ("sound2midi MPE")
 uv run sound2midi-mpe-play output/<id>/<id>.stems.mpe.mid

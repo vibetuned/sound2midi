@@ -12,7 +12,7 @@ from pathlib import Path
 import mido
 
 from sound2midi.beatgrid import tick_to_sec_fn
-from sound2midi.expression import context, curves, loudness, timing, velocity
+from sound2midi.expression import airwave, context, curves, loudness, timing, velocity
 from sound2midi.expression import mpe_encoder as encoder
 from sound2midi.expression.mpe_encoder import PerfNote, TimedMessage
 
@@ -101,6 +101,17 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Velocity only, expression streams muted (for A/B comparison).",
     )
     parser.add_argument(
+        "--airwave",
+        type=Path,
+        default=None,
+        metavar="MIDI",
+        help="Another MIDI file whose content drives a synthesized Airwave "
+        "gesture layer for midi-sink (vortex/swirl/pinch/ripple, CCs 20-29 "
+        "on channel 1): its melody steers the swirl, its energy the vortex "
+        "and ripples, its accents the pinches. The gestures are merged into "
+        "the same output/stream, in sync with the music.",
+    )
+    parser.add_argument(
         "--wind",
         action="store_true",
         help="Simulate a wind MIDI instrument: winds profile everywhere, tracks "
@@ -173,6 +184,14 @@ class Performance:
     events: list[TimedMessage]
     perf_notes: list[PerfNote]
     bend_range: int
+    airwave_events: list[TimedMessage] | None = None
+
+
+def merge_events(*streams: list[TimedMessage]) -> list[TimedMessage]:
+    """Interleave event streams by time (stable within equal times)."""
+    merged = [event for stream in streams for event in stream]
+    merged.sort(key=lambda e: (e[0], e[1]))
+    return merged
 
 
 def build_performance(args: argparse.Namespace) -> Performance:
@@ -247,7 +266,27 @@ def build_performance(args: argparse.Namespace) -> Performance:
 
     breath_cc = 2 if args.wind and not args.dry else None
     events = encoder.encode(perf_notes, bend_range=args.bend_range, breath_cc=breath_cc)
-    return Performance(mid=mid, events=events, perf_notes=perf_notes, bend_range=args.bend_range)
+
+    airwave_events = None
+    if args.airwave is not None:
+        if not args.airwave.is_file():
+            raise SystemExit(f"--airwave source MIDI not found: {args.airwave}")
+        gesture_mid = mido.MidiFile(str(args.airwave))
+        gesture_tracks = context.extract_tracks(gesture_mid)
+        context.annotate(gesture_tracks, artifacts, gesture_mid.ticks_per_beat)
+        airwave_events = airwave.synthesize(gesture_tracks, artifacts, rng)
+        events = merge_events(events, airwave_events)
+        _log(
+            f"Airwave gestures from {args.airwave.name}: "
+            f"{len(airwave_events)} CC events merged on channel 1"
+        )
+    return Performance(
+        mid=mid,
+        events=events,
+        perf_notes=perf_notes,
+        bend_range=args.bend_range,
+        airwave_events=airwave_events,
+    )
 
 
 def render_main(argv: list[str] | None = None) -> int:
@@ -361,6 +400,11 @@ def play_main(argv: list[str] | None = None) -> int:
             )
         if args.solo_track is not None:
             _log("--solo-track only applies with --live; playing the full file.")
+        if args.airwave is not None:
+            _log(
+                "--airwave only applies when rendering (or with --live); a "
+                ".mpe.mid rendered with --airwave already carries the gestures."
+            )
 
     outputs = realtime.open_outputs(
         args.port_name or realtime.PORT_NAME,
