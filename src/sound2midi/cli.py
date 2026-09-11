@@ -8,9 +8,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from sound2midi import __version__
+from sound2midi import muscriptor as muscriptor_backend
 from sound2midi.amt import (
     MODEL_TYPES,
     default_amt_home,
+    default_analysis_home,
     detect_chords,
     detect_key,
     detect_meter,
@@ -26,7 +28,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sound2midi",
         description="Download a YouTube video's audio and transcribe it to MIDI "
-        "with instrument-agnostic-amt.",
+        "with tsumugi or MuScriptor.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -49,19 +51,32 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Base directory; each song gets its own subfolder (default: %(default)s).",
     )
     parser.add_argument(
+        "--transcriber",
+        choices=("tsumugi", "muscriptor"),
+        default="tsumugi",
+        help="Transcription model (default: %(default)s). 'tsumugi' is the "
+        "instrument-agnostic Semi-CRF model (ex instrument-agnostic-amt); "
+        "'muscriptor' is Kyutai/Mirelo's transformer decoder, whose weights are "
+        "gated on Hugging Face under a non-commercial licence.",
+    )
+    parser.add_argument(
         "-t",
         "--type",
         dest="model_type",
-        choices=MODEL_TYPES,
-        default="default",
-        help="AMT model variant (default: %(default)s).",
+        default=None,
+        metavar="MODEL",
+        help="Model variant. tsumugi: "
+        + ", ".join(MODEL_TYPES)
+        + " (default: default). muscriptor: "
+        + ", ".join(muscriptor_backend.MODEL_SIZES)
+        + " (default: medium), or a safetensors path / hf:// URL.",
     )
     parser.add_argument(
         "--device",
-        choices=("cuda", "cpu", "mps"),
+        choices=("auto", "cuda", "cpu", "mps"),
         default=None,
-        help="Inference device. Defaults to CUDA when available, else CPU. "
-        "'mps' (Apple GPU) is experimental.",
+        help="Inference device. Defaults to the model's own auto-detection "
+        "(CUDA, then Apple GPU 'mps', then CPU).",
     )
     parser.add_argument(
         "--no-amp",
@@ -84,8 +99,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--amt-home",
         type=Path,
         default=None,
-        help="Where to keep the AMT checkout + venv "
-        "(default: $SOUND2MIDI_AMT_HOME or ~/.cache/sound2midi/...).",
+        help="Where to keep the tsumugi checkout + venv "
+        "(default: $SOUND2MIDI_AMT_HOME or ~/.cache/sound2midi/tsumugi).",
     )
     stems = parser.add_argument_group("stem-separated mode (replicates the Colab workflow)")
     stems.add_argument(
@@ -106,16 +121,28 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --stems: delete the separated stem WAVs when done.",
     )
+    stems.add_argument(
+        "--low-vram",
+        action="store_true",
+        help="With --stems: keep the models in CPU memory and move one at a "
+        "time onto the GPU (slower, but fits in less VRAM).",
+    )
+    stems.add_argument(
+        "--no-stem-velocity",
+        dest="stem_velocity",
+        action="store_false",
+        help="With --stems: skip upstream's per-note velocity model.",
+    )
 
     parser.add_argument(
         "--setup-only",
         action="store_true",
-        help="Clone the AMT repo and build its environment, then exit.",
+        help="Build the chosen transcriber's environment, then exit.",
     )
     parser.add_argument(
         "--reinstall",
         action="store_true",
-        help="Rebuild the AMT venv from scratch.",
+        help="Rebuild the transcriber's venv from scratch.",
     )
     parser.add_argument(
         "--infer-arg",
@@ -123,8 +150,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="ARG",
-        help="Extra argument forwarded verbatim to infer.py. Repeatable, e.g. "
-        "--infer-arg=--velocity --infer-arg=110.",
+        help="Extra argument forwarded verbatim to the transcriber's CLI. "
+        "Repeatable, e.g. --infer-arg=--velocity --infer-arg=110.",
     )
     parser.add_argument(
         "--no-key",
@@ -143,7 +170,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--chords",
         action="store_true",
         help="Detect the chord progression (lv-chordia, large vocabulary), saved as "
-        "<song>.chords.json. Opt-in; installs into the AMT venv on first use.",
+        "<song>.chords.json. Opt-in; installs into the tsumugi venv on first use.",
     )
     parser.add_argument(
         "--sections",
@@ -162,15 +189,57 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_model(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str:
+    """The model variant for the chosen transcriber, validated with its own set."""
+    if args.transcriber == "muscriptor":
+        model = args.model_type or muscriptor_backend.DEFAULT_MODEL
+        # Sizes are keywords; anything path- or URL-shaped is passed through.
+        if model not in muscriptor_backend.MODEL_SIZES and not (
+            "/" in model or model.endswith(".safetensors")
+        ):
+            parser.error(
+                f"--type {model!r} is not a MuScriptor model; choose from "
+                f"{', '.join(muscriptor_backend.MODEL_SIZES)}, or give a "
+                "safetensors path / hf:// URL."
+            )
+        return model
+    model = args.model_type or "default"
+    if model not in MODEL_TYPES:
+        parser.error(
+            f"--type {model!r} is not a tsumugi model; choose from {', '.join(MODEL_TYPES)}."
+        )
+    return model
+
+
+def _model_tag(args: argparse.Namespace, model: str) -> str:
+    """The per-model output folder name, so runs can be compared side by side.
+
+    Stem mode uses one model per stem rather than a single ``--type``, so it is
+    tagged by the mode instead.
+    """
+    return f"{args.transcriber}-{'stems' if args.stems else model}"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     amt_home = args.amt_home or default_amt_home()
+    muscriptor_home = muscriptor_backend.default_muscriptor_home()
+    # The detectors keep their own venv, so they behave the same for either
+    # transcriber (and skey's torch pin cannot disturb the transcriber's).
+    analysis_home = default_analysis_home()
+    model = _resolve_model(args, parser)
+    if args.stems and args.transcriber != "tsumugi":
+        parser.error("--stems is a tsumugi workflow (it uses its per-stem models).")
 
     if args.setup_only:
-        python = setup(amt_home, reinstall=args.reinstall)
-        print(f"AMT ready at {amt_home}\n  venv python: {python}")
+        if args.transcriber == "muscriptor":
+            python = muscriptor_backend.setup(muscriptor_home, reinstall=args.reinstall)
+            print(f"MuScriptor ready at {muscriptor_home}\n  venv python: {python}")
+        else:
+            python = setup(amt_home, reinstall=args.reinstall)
+            print(f"tsumugi ready at {amt_home}\n  venv python: {python}")
         return 0
 
     if not args.source:
@@ -206,20 +275,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.quiet:
             print(f"Audio: {audio_path}")
 
+    # The audio and the analysis artifacts are model-independent and stay in the
+    # song folder; each model's MIDI (and its stems) gets its own subfolder, so
+    # transcribing the same song with another model compares instead of
+    # overwriting. -o/--output still names an exact path.
+    run_dir = song_dir / _model_tag(args, model)
     if args.output:
         output_midi = args.output
-    elif args.stems:
-        output_midi = song_dir / f"{song_name}.stems.mid"
     else:
-        output_midi = song_dir / f"{song_name}.mid"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        suffix = ".stems.mid" if args.stems else ".mid"
+        output_midi = run_dir / f"{song_name}{suffix}"
 
     if output_midi.exists() and not args.force:
         print(f"MIDI already exists: {output_midi}  (use --force to regenerate)")
     else:
         if args.reinstall:
-            setup(amt_home, reinstall=True)
+            if args.transcriber == "muscriptor":
+                muscriptor_backend.setup(muscriptor_home, reinstall=True)
+            else:
+                setup(amt_home, reinstall=True)
 
-        if args.stems:
+        if args.transcriber == "muscriptor":
+            if not args.quiet:
+                print(f"Transcribing with MuScriptor -> {output_midi} (model: {model}) ...")
+            muscriptor_backend.transcribe(
+                audio_path,
+                output_midi,
+                home=muscriptor_home,
+                model=model,
+                device=args.device,
+                extra_args=args.infer_args,
+                quiet=args.quiet,
+            )
+        elif args.stems:
             if not args.quiet:
                 print(f"Stem-separated transcription -> {output_midi} ...")
             transcribe_stems(
@@ -230,16 +319,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 transcribe_drums=args.transcribe_drums,
                 cleanup_stems=args.cleanup_stems,
                 force=args.force,
-                output_root=song_dir / "stems",
+                output_root=output_midi.parent / "stems",
+                low_vram=args.low_vram,
+                predict_velocity=args.stem_velocity,
             )
         else:
             if not args.quiet:
-                print(f"Transcribing -> {output_midi} (model: {args.model_type}) ...")
+                print(f"Transcribing -> {output_midi} (model: {model}) ...")
             transcribe(
                 audio_path,
                 output_midi,
                 home=amt_home,
-                model_type=args.model_type,
+                model_type=model,
                 device=args.device,
                 amp=args.amp,
                 amp_dtype=args.amp_dtype,
@@ -255,7 +346,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("Detecting key (skey) ...")
             try:
                 key = detect_key(
-                    audio_path, home=amt_home, device=args.device, output_json=key_json
+                    audio_path,
+                    home=analysis_home,
+                    device=args.device,
+                    output_json=key_json,
                 )
                 print(f"Detected key: {key}  (saved to {key_json})")
             except Exception as exc:  # non-fatal: don't lose the transcription
@@ -271,7 +365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 meter = detect_meter(
                     audio_path,
-                    home=amt_home,
+                    home=analysis_home,
                     midi_path=output_midi,
                     device=args.device,
                     output_json=meter_json,
@@ -291,7 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.quiet:
                 print("Detecting chords (lv-chordia) ...")
             try:
-                chords = detect_chords(audio_path, home=amt_home, output_json=chords_json)
+                chords = detect_chords(audio_path, home=analysis_home, output_json=chords_json)
                 print(
                     f"Detected {chords['n_chords']} chords "
                     f"({chords['distinct']} distinct)  (saved to {chords_json})"

@@ -167,9 +167,14 @@ def _resolve_profile(
 
 
 def _default_stems_dir(midi_path: Path) -> Path:
-    """The song's stem-WAV root: ``stems/`` next to the MIDI, or the ``stems``
-    tree a per-stem MIDI already lives in (``.../stems/midi/<song>_vocals.mid``)."""
-    for base in list(midi_path.resolve().parents)[:3]:
+    """The song's stem-WAV root: ``stems/`` next to the MIDI, or the outermost
+    ``stems`` tree a per-stem MIDI lives in (upstream nests
+    ``stems/<song>/stem_midis/`` beside ``stems/<song>/stems/<song>/``)."""
+    parents = list(midi_path.resolve().parents)[:6]
+    for base in reversed(parents):  # outermost "stems" wins: it holds both trees
+        if base.name == "stems":
+            return base
+    for base in parents:
         if base.name == "stems":
             return base
         candidate = base / "stems"

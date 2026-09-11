@@ -1,10 +1,11 @@
 [project]
 name = "sound2midi"
 version = "0.1.0"
-description = "Download audio from YouTube and transcribe it to MIDI with instrument-agnostic-amt."
+description = "Download audio from YouTube and transcribe it to MIDI with tsumugi or MuScriptor."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 dependencies = [
     # [default] brings yt-dlp-ejs (the YouTube JS-challenge solver — without it
     # media downloads 403); [deno] provides the JS runtime the solver needs.

@@ -28,6 +28,10 @@ from sound2midi.expression.mpe_encoder import (
 
 PORT_NAME = "sound2midi MPE"
 _SLEEP_MARGIN_S = 0.002  # sleep to just before the deadline, busy-wait the rest
+# Give the synth a moment to apply the MPE zone/bend-range RPNs before the
+# first note arrives; a note sent microseconds after the handshake can be
+# swallowed while the zone is still being configured.
+HANDSHAKE_SETTLE_S = 0.05
 
 
 def list_ports() -> list[str]:
@@ -173,22 +177,27 @@ def stream(
     position in the performance; it refreshes only while the scheduler is
     sleeping ahead of the next deadline, so send timing is unaffected.
     """
-    playlist = [e for e in events if e[0] >= start]
+    # ``--start`` seeks; without one, play everything. Rubato's melody lead can
+    # pull the opening note slightly before t=0, so the timeline origin follows
+    # the earliest event instead of dropping it (and its note_on with it).
+    playlist = list(events) if start <= 0.0 else [e for e in events if e[0] >= start]
     if not playlist:
         print("Nothing to play after --start.", file=sys.stderr)
         return
-    duration = playlist[-1][0] - start
+    origin = start if start > 0.0 else min(0.0, playlist[0][0])
+    duration = playlist[-1][0] - origin
     try:
         while True:
             if handshake:
                 for msg in handshake_messages(bend_range):
                     send_message(outputs, msg)
+                time.sleep(HANDSHAKE_SETTLE_S)
             bar = _progress_bar(duration, description)
             try:
                 t0 = time.monotonic()
                 last_draw = 0.0
                 for event_time, _, _, msg in playlist:
-                    deadline = t0 + (event_time - start)
+                    deadline = t0 + (event_time - origin)
                     while True:
                         now = time.monotonic()
                         delay = deadline - now

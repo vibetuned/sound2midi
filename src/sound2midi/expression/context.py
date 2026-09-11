@@ -157,10 +157,10 @@ def _find_artifacts_dir(midi_path: Path, song: str) -> Path:
     """The nearest ``artifacts/`` dir (walking up) that holds this song's files.
 
     Handles both the merged layout (``output/<id>/<id>.stems.mid`` with
-    ``artifacts/`` as a sibling) and per-stem MIDIs two levels down
-    (``output/<id>/stems/midi/<id>_vocals.mid``).
+    ``artifacts/`` as a sibling) and per-stem MIDIs several levels down
+    (``output/<id>/stems/<id>/stem_midis/<id>_vocals.mid``).
     """
-    for base in list(midi_path.resolve().parents)[:3]:
+    for base in list(midi_path.resolve().parents)[:6]:
         candidate = base / "artifacts"
         if candidate.is_dir() and any(candidate.glob(f"{song}.*.json")):
             return candidate

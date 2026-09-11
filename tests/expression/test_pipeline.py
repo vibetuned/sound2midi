@@ -192,3 +192,38 @@ def test_wind_flag_renders_breath_and_monophony(tmp_path, capsys):
     messages = [m for track in mido.MidiFile(str(plain)).tracks for m in track]
     assert len([m for m in messages if m.type == "note_on"]) == 16
     assert not any(m.type == "control_change" and m.control == 2 for m in messages)
+
+
+def test_per_stem_midi_in_upstream_layout(tmp_path, capsys):
+    """Upstream's stem pipeline nests deeper than the old layout:
+    output/<id>/stems/<id>/stem_midis/<id>_vocals.mid, with the WAVs under
+    stems/<id>/stems/<id>/. Artifacts and stem audio must still be found."""
+    song = tmp_path / "output" / "deep"
+    midi_dir = song / "stems" / "deep" / "stem_midis"
+    wav_dir = song / "stems" / "deep" / "stems" / "deep"
+    midi_dir.mkdir(parents=True)
+    wav_dir.mkdir(parents=True)
+    from conftest import make_artifacts
+
+    make_artifacts(song / "artifacts", "deep")
+    _crescendo_wav(wav_dir / "deep_vocals.wav", seconds=12.0)
+    make_midi(
+        midi_dir / "deep_vocals.mid",
+        [[(60 + i % 5, 0.5 + i * 1.0, 0.6) for i in range(10)]],
+    )
+
+    assert song_name(midi_dir / "deep_vocals.mid") == "deep"
+    assert not load_artifacts(midi_dir / "deep_vocals.mid").missing
+
+    from sound2midi.expression.cli import _default_stems_dir
+
+    stems_dir = _default_stems_dir(midi_dir / "deep_vocals.mid")
+    assert loudness.find_stem_wavs(stems_dir).get("vocals") == wav_dir / "deep_vocals.wav"
+
+    assert render_main([str(midi_dir / "deep_vocals.mid"), "--seed", "3"]) == 0
+    err = capsys.readouterr().err
+    assert "Artifacts missing" not in err
+    assert "profile=sung" in err
+    mid = mido.MidiFile(str(midi_dir / "deep_vocals.mpe.mid"))
+    velocities = [m.velocity for t in mid.tracks for m in t if m.type == "note_on"]
+    assert velocities[-1] > velocities[0]  # the stem WAV's crescendo drives them

@@ -1,36 +1,80 @@
-"""Manage the vendored instrument-agnostic-amt checkout and run its inference script.
+"""Manage the tsumugi (ex instrument-agnostic-amt) checkout and run its inference CLI.
 
-The upstream project (https://github.com/anime-song/instrument-agnostic-amt) is a
-script-based repo, not a pip-installable package: ``infer.py`` imports sibling modules
-and pins a CUDA-specific build of torch. We therefore keep it in its own directory with
-its own uv-managed virtualenv and call ``infer.py`` as a subprocess.
+The upstream project (https://github.com/anime-song/tsumugi) is a uv workspace, not a
+pip-installable package (``[tool.uv] package = false``): its modules are imported from
+the checkout root and its torch pin is resolved per platform by ``uv.lock``. We keep it
+in its own directory with its own uv-managed virtualenv and call its inference CLI as a
+subprocess.
+
+Upstream renamed the project from ``instrument-agnostic-amt`` to ``tsumugi`` and moved
+from ``requirements.txt`` + a root ``infer.py`` to ``uv.lock`` + the
+``instrument_agnostic_amt.amt.cli.infer`` module; the Python package name is unchanged.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-AMT_REPO_URL = "https://github.com/anime-song/instrument-agnostic-amt.git"
+AMT_REPO_URL = "https://github.com/anime-song/tsumugi.git"
 AMT_REF = "main"
-# Pin the AMT venv to a Python with broad ML-wheel coverage (torch, miditoolkit, ...).
-AMT_PYTHON_VERSION = "3.12"
+# The inference entry point inside the checkout (upstream package layout).
+AMT_INFER_MODULE = "instrument_agnostic_amt.amt.cli.infer"
+# The pre-rename cache directory, kept only to point users at the stale copy.
+LEGACY_AMT_DIRNAME = "instrument-agnostic-amt"
 
+# Upstream checkpoint variants. The ``_v1_5`` / ``_v2`` models are the newer
+# retrains and are what the upstream Colab defaults to per stem.
 MODEL_TYPES = (
     "default",
     "bass",
+    "bass_v2",
     "vocal",
     "guitar",
+    "guitar_v1_5",
     "vocal_harmony",
+    "vocal_harmony_v1_5",
     "drums",
+    "drums_v1_5",
     "other",
+    "other_v1_5",
 )
+
+
+# The audio-analysis detectors (skey, beat-this, lv-chordia) used to ride the
+# transcriber's venv to reuse its torch. They can no longer: skey pins
+# ``torch>=2.7,<2.8`` while tsumugi pins ``torch==2.13``, so sharing one venv
+# silently downgrades the transcriber. They now get their own environment,
+# which also means they work the same whichever transcriber is selected.
+ANALYSIS_PYTHON_VERSION = "3.12"
+
+
+def default_analysis_home() -> Path:
+    """Where the analysis venv lives, overridable via ``SOUND2MIDI_ANALYSIS_HOME``."""
+    override = os.environ.get("SOUND2MIDI_ANALYSIS_HOME")
+    if override:
+        return Path(override).expanduser()
+    cache = os.environ.get("XDG_CACHE_HOME")
+    base = Path(cache).expanduser() if cache else Path.home() / ".cache"
+    return base / "sound2midi" / "analysis"
+
+
+def ensure_analysis_env(home: Path, *, reinstall: bool = False) -> Path:
+    """Create the analysis venv (no project deps of its own); return its python."""
+    venv_dir = home / ".venv"
+    python = _venv_python(home)
+    if reinstall and venv_dir.exists():
+        shutil.rmtree(venv_dir)
+    if python.exists():
+        return python
+    home.mkdir(parents=True, exist_ok=True)
+    _run([_uv(), "venv", "--python", ANALYSIS_PYTHON_VERSION, str(venv_dir)])
+    return python
 
 
 def default_amt_home() -> Path:
@@ -40,7 +84,7 @@ def default_amt_home() -> Path:
         return Path(override).expanduser()
     cache = os.environ.get("XDG_CACHE_HOME")
     base = Path(cache).expanduser() if cache else Path.home() / ".cache"
-    return base / "sound2midi" / "instrument-agnostic-amt"
+    return base / "sound2midi" / "tsumugi"
 
 
 def _uv() -> str:
@@ -52,10 +96,55 @@ def _uv() -> str:
     return uv
 
 
+def _ffmpeg_lib_dirs() -> list[str]:
+    """Directories holding FFmpeg's shared libraries, for torchcodec on macOS.
+
+    torchaudio 2.11 decodes through torchcodec, which dlopen()s the system
+    FFmpeg libraries at decode time. Homebrew keeps those outside the default
+    dylib search path, so torchcodec finds none of its supported versions and
+    audio loading dies with "Could not load this library".
+    """
+    candidates: list[str] = []
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:  # .../Cellar/ffmpeg/<version>/bin/ffmpeg -> .../lib
+        candidates.append(str(Path(ffmpeg).resolve().parent.parent / "lib"))
+    prefix = os.environ.get("HOMEBREW_PREFIX")
+    for base in (prefix, "/opt/homebrew", "/usr/local"):
+        if base:
+            candidates.append(f"{base}/opt/ffmpeg/lib")
+            candidates.append(f"{base}/lib")
+    seen: list[str] = []
+    for directory in candidates:
+        if directory not in seen and Path(directory).is_dir():
+            seen.append(directory)
+    return seen
+
+
+def _child_env() -> dict[str, str] | None:
+    """The environment for model subprocesses (None to inherit unchanged)."""
+    if sys.platform != "darwin":
+        return None
+    dirs = _ffmpeg_lib_dirs()
+    if not dirs:
+        return None
+    env = os.environ.copy()
+    existing = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    parts = [d for d in dirs if d not in existing.split(":")]
+    if existing:
+        parts.append(existing)
+    env["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(parts)
+    return env
+
+
 def _run(cmd: Sequence[str], *, cwd: Path | None = None) -> None:
     printable = " ".join(str(c) for c in cmd)
     print(f"$ {printable}", file=sys.stderr, flush=True)
-    subprocess.run([str(c) for c in cmd], cwd=str(cwd) if cwd else None, check=True)
+    subprocess.run(
+        [str(c) for c in cmd],
+        cwd=str(cwd) if cwd else None,
+        check=True,
+        env=_child_env(),
+    )
 
 
 def _venv_python(home: Path) -> Path:
@@ -69,24 +158,6 @@ def _default_device() -> str:
     return "cpu" if sys.platform == "darwin" else "cuda"
 
 
-def _portable_requirements(requirements: Path, venv_dir: Path) -> Path:
-    """On macOS, rewrite a CUDA-pinned requirements file to the plain PyPI builds.
-
-    CUDA wheels (``+cu128``) and the pytorch.org CUDA index don't exist for
-    macOS; the same versions from PyPI ship the CPU/MPS build instead.
-    """
-    if sys.platform != "darwin":
-        return requirements
-    lines = [
-        re.sub(r"\+cu\d+", "", line)
-        for line in requirements.read_text().splitlines()
-        if "download.pytorch.org/whl/cu" not in line
-    ]
-    filtered = venv_dir / "requirements-macos.txt"
-    filtered.write_text("\n".join(lines) + "\n")
-    return filtered
-
-
 def ensure_repo(home: Path, *, ref: str = AMT_REF) -> Path:
     """Clone the AMT repo into ``home`` if it is not already there."""
     if (home / ".git").exists():
@@ -97,12 +168,25 @@ def ensure_repo(home: Path, *, ref: str = AMT_REF) -> Path:
             "Remove it or pass a different --amt-home."
         )
     home.parent.mkdir(parents=True, exist_ok=True)
+    legacy = home.parent / LEGACY_AMT_DIRNAME
+    if legacy.is_dir():
+        print(
+            f"note: upstream renamed the project to tsumugi; the pre-rename checkout at "
+            f"{legacy} is no longer used and can be deleted.",
+            file=sys.stderr,
+        )
     _run(["git", "clone", "--depth", "1", "--branch", ref, AMT_REPO_URL, str(home)])
     return home
 
 
 def ensure_env(home: Path, *, reinstall: bool = False) -> Path:
-    """Create the AMT venv and install its requirements; return its python executable."""
+    """Sync the tsumugi venv from its lockfile; return its python executable.
+
+    Upstream replaced the CUDA-pinned ``requirements.txt`` with ``uv.lock``, whose
+    torch index is selected by platform marker (Linux/Windows resolve the CUDA
+    wheels, macOS the platform ones), so nothing has to be rewritten here. The
+    ``stem`` extra carries stem-splitter/librosa for the stem workflow.
+    """
     venv_dir = home / ".venv"
     marker = venv_dir / ".sound2midi-deps-installed"
     python = _venv_python(home)
@@ -113,14 +197,12 @@ def ensure_env(home: Path, *, reinstall: bool = False) -> Path:
     if marker.exists() and python.exists():
         return python
 
-    uv = _uv()
-    _run([uv, "venv", "--python", AMT_PYTHON_VERSION, str(venv_dir)])
-
-    requirements = home / "requirements.txt"
-    if not requirements.exists():
-        raise FileNotFoundError(f"No requirements.txt found in AMT repo at {home}.")
-    requirements = _portable_requirements(requirements, venv_dir)
-    _run([uv, "pip", "install", "--python", str(python), "-r", str(requirements)])
+    if not (home / "uv.lock").exists():
+        raise FileNotFoundError(
+            f"No uv.lock found in the tsumugi checkout at {home}. "
+            "Remove that directory so it can be re-cloned."
+        )
+    _run([_uv(), "sync", "--locked", "--extra", "stem"], cwd=home)
 
     marker.write_text("ok\n")
     return python
@@ -144,16 +226,23 @@ def transcribe(
     extra_args: Sequence[str] = (),
     quiet: bool = False,
 ) -> Path:
-    """Run ``infer.py`` on ``audio_path`` and write MIDI to ``output_midi``."""
+    """Run the tsumugi inference CLI on ``audio_path``, writing ``output_midi``.
+
+    ``device`` is passed through when given; omitting it lets upstream pick
+    (``auto`` resolves CUDA, then Apple Silicon MPS, then CPU).
+    """
     if model_type not in MODEL_TYPES:
         raise ValueError(f"Unknown model type {model_type!r}; choose from {MODEL_TYPES}.")
 
     python = setup(home)
     output_midi.parent.mkdir(parents=True, exist_ok=True)
 
+    # ``-m`` with cwd=home: the checkout root is on sys.path, and upstream is a
+    # uv workspace whose package is deliberately not installed into the venv.
     cmd: list[str] = [
         str(python),
-        "infer.py",
+        "-m",
+        AMT_INFER_MODULE,
         "--audio",
         str(audio_path.resolve()),
         "--output-midi",
@@ -172,12 +261,10 @@ def transcribe(
     _run(cmd, cwd=home)
 
     if not output_midi.exists():
-        raise FileNotFoundError(f"infer.py finished but no MIDI was written to {output_midi}.")
+        raise FileNotFoundError(
+            f"tsumugi inference finished but no MIDI was written to {output_midi}."
+        )
     return output_midi
-
-
-# Extra packages the Colab stem workflow needs on top of requirements.txt.
-STEM_DEPS = ("stem-splitter", "librosa")
 
 
 def _stem_pipeline_script() -> Path:
@@ -186,14 +273,8 @@ def _stem_pipeline_script() -> Path:
 
 
 def ensure_stem_deps(home: Path, *, reinstall: bool = False) -> Path:
-    """Ensure the AMT env plus the stem-separation extras are installed."""
-    python = ensure_env(home, reinstall=reinstall)
-    marker = home / ".venv" / ".sound2midi-stem-deps-installed"
-    if marker.exists() and not reinstall:
-        return python
-    _run([_uv(), "pip", "install", "--python", str(python), *STEM_DEPS])
-    marker.write_text("ok\n")
-    return python
+    """The stem workflow's deps ride the ``stem`` extra that :func:`ensure_env` syncs."""
+    return ensure_env(home, reinstall=reinstall)
 
 
 def transcribe_stems(
@@ -209,16 +290,19 @@ def transcribe_stems(
     cleanup_stems: bool = False,
     force: bool = False,
     output_root: Path | None = None,
+    low_vram: bool = False,
+    predict_velocity: bool = True,
 ) -> Path:
     """Separate the audio into stems, transcribe each, and merge into ``output_midi``.
 
-    Replicates the upstream Colab's stem workflow. Per-stem MIDIs are kept under
-    ``output_root`` for inspection / playback.
+    Runs upstream's own stem workflow. Per-stem MIDIs are kept under ``output_root``
+    for inspection / playback, and ``predict_velocity`` adds upstream's per-note
+    velocity model (real dynamics rather than a constant).
 
-    The pipeline is resumable: separated stems and per-stem MIDIs that already exist
-    are reused (unless ``force``), and if the child process dies on a signal (e.g. an
-    intermittent native SIGSEGV in the torch/CUDA stack) it is retried once, picking up
-    from the stems already completed.
+    Separated stems that already exist are reused, so a run interrupted after the
+    separation stage picks up from there; ``force`` discards them and starts over.
+    If the child dies on a signal (e.g. an intermittent native SIGSEGV in the
+    torch stack) it is retried once.
     """
     ensure_repo(home)
     python = ensure_stem_deps(home)
@@ -254,6 +338,10 @@ def transcribe_stems(
         cmd += ["--cleanup-stems"]
     if force:
         cmd += ["--force"]
+    if low_vram:
+        cmd += ["--low-vram"]
+    if not predict_velocity:
+        cmd += ["--no-velocity"]
 
     attempts = 2
     for attempt in range(1, attempts + 1):
@@ -285,8 +373,8 @@ def _key_detect_script() -> Path:
 
 
 def ensure_key_deps(home: Path, *, reinstall: bool = False) -> Path:
-    """Ensure the AMT env plus skey (key detection) are installed."""
-    python = ensure_env(home, reinstall=reinstall)
+    """Ensure the analysis env plus skey (key detection) are installed."""
+    python = ensure_analysis_env(home, reinstall=reinstall)
     marker = home / ".venv" / ".sound2midi-key-deps-installed"
     if marker.exists() and not reinstall:
         return python
@@ -304,8 +392,8 @@ def _meter_detect_script() -> Path:
 
 
 def ensure_meter_deps(home: Path, *, reinstall: bool = False) -> Path:
-    """Ensure the AMT env plus beat-this (meter detection) are installed."""
-    python = ensure_env(home, reinstall=reinstall)
+    """Ensure the analysis env plus beat-this (meter detection) are installed."""
+    python = ensure_analysis_env(home, reinstall=reinstall)
     marker = home / ".venv" / ".sound2midi-meter-deps-installed"
     if marker.exists() and not reinstall:
         return python
@@ -342,7 +430,9 @@ def detect_meter(
         cmd += ["--output-json", str(output_json.resolve())]
 
     print(f"$ {' '.join(cmd)}", file=sys.stderr, flush=True)
-    result = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        [str(c) for c in cmd], capture_output=True, text=True, check=True, env=_child_env()
+    )
 
     for line in reversed(result.stdout.strip().splitlines()):
         line = line.strip()
@@ -369,8 +459,8 @@ def _chords_detect_script() -> Path:
 
 
 def ensure_chord_deps(home: Path, *, reinstall: bool = False) -> Path:
-    """Ensure the AMT env plus lv-chordia (chord recognition) are installed."""
-    python = ensure_env(home, reinstall=reinstall)
+    """Ensure the analysis env plus lv-chordia (chord recognition) are installed."""
+    python = ensure_analysis_env(home, reinstall=reinstall)
     marker = home / ".venv" / ".sound2midi-chord-deps-installed"
     if marker.exists() and not reinstall:
         return python
@@ -404,7 +494,9 @@ def detect_chords(
         cmd += ["--output-json", str(output_json.resolve())]
 
     print(f"$ {' '.join(cmd)}", file=sys.stderr, flush=True)
-    result = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        [str(c) for c in cmd], capture_output=True, text=True, check=True, env=_child_env()
+    )
 
     for line in reversed(result.stdout.strip().splitlines()):
         line = line.strip()
@@ -445,7 +537,9 @@ def detect_key(
         cmd += ["--output-json", str(output_json.resolve())]
 
     print(f"$ {' '.join(cmd)}", file=sys.stderr, flush=True)
-    result = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        [str(c) for c in cmd], capture_output=True, text=True, check=True, env=_child_env()
+    )
 
     for line in reversed(result.stdout.strip().splitlines()):
         line = line.strip()
